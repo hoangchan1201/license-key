@@ -8,12 +8,14 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import psycopg
+from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, jsonify, request
 from psycopg.rows import dict_row
 
 app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_TOKEN = os.environ.get("LICENSE_ADMIN_TOKEN", "")
+LICENSE_KEY_ENCRYPTION_KEY = os.environ.get("LICENSE_KEY_ENCRYPTION_KEY", "")
 ONLINE_WINDOW_SECONDS = 100
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
@@ -31,6 +33,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS licenses (
                 key_hash TEXT PRIMARY KEY,
                 key_hint TEXT NOT NULL,
+                encrypted_key TEXT,
                 duration_seconds BIGINT NOT NULL CHECK (duration_seconds > 0),
                 issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 activated_at TIMESTAMPTZ,
@@ -40,6 +43,9 @@ def init_db():
                 revoked_at TIMESTAMPTZ
             )
         """)
+        # Existing installations only have hashes; the new nullable column lets
+        # future keys be recoverable by the authenticated admin API.
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS encrypted_key TEXT")
 
 
 @app.before_request
@@ -144,6 +150,13 @@ def create_licenses():
     denied = require_admin()
     if denied:
         return denied
+    if not LICENSE_KEY_ENCRYPTION_KEY:
+        return jsonify(error="key_encryption_not_configured"), 503
+    try:
+        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii"))
+    except Exception:
+        app.logger.exception("LICENSE_KEY_ENCRYPTION_KEY is invalid")
+        return jsonify(error="key_encryption_configuration_invalid"), 503
     data = get_payload()
     try:
         # Accept duration_seconds for hourly keys; retain days for older admin clients.
@@ -162,8 +175,8 @@ def create_licenses():
         for _ in range(count):
             key = "DEW-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
             conn.execute(
-                "INSERT INTO licenses(key_hash,key_hint,duration_seconds) VALUES (%s,%s,%s)",
-                (key_hash(key), key[:8] + "…" + key[-4:], duration_seconds),
+                "INSERT INTO licenses(key_hash,key_hint,encrypted_key,duration_seconds) VALUES (%s,%s,%s,%s)",
+                (key_hash(key), key[:8] + "…" + key[-4:], key_cipher.encrypt(key.encode("utf-8")).decode("ascii"), duration_seconds),
             )
             generated.append(key)
     return jsonify(created=len(generated), duration_seconds=duration_seconds, keys=generated), 201
@@ -177,13 +190,24 @@ def list_licenses():
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
-            "SELECT key_hint, issued_at, activated_at, expires_at, last_seen, revoked_at FROM licenses ORDER BY issued_at DESC"
+            "SELECT key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, revoked_at FROM licenses ORDER BY issued_at DESC"
         ).fetchall()
+    try:
+        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
+    except Exception:
+        key_cipher = None
     output = []
     for row in rows:
         online = bool(row["last_seen"] and (now - row["last_seen"]).total_seconds() <= ONLINE_WINDOW_SECONDS and not row["revoked_at"] and (not row["expires_at"] or row["expires_at"] > now))
+        full_key = None
+        if row["encrypted_key"] and key_cipher:
+            try:
+                full_key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
+            except (InvalidToken, ValueError, UnicodeError):
+                full_key = None
         output.append({
-            "key_hint": row["key_hint"], "activated_at": row["activated_at"],
+            "key_hint": row["key_hint"], "key": full_key,
+            "duration_seconds": row["duration_seconds"], "activated_at": row["activated_at"],
             "expires_at": row["expires_at"], "online": online,
             "revoked": bool(row["revoked_at"]),
         })
