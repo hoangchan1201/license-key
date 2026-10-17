@@ -146,12 +146,16 @@ def create_licenses():
         return denied
     data = get_payload()
     try:
-        days = int(data.get("days", 0))
+        # Accept duration_seconds for hourly keys; retain days for older admin clients.
+        if "duration_seconds" in data:
+            duration_seconds = int(data.get("duration_seconds", 0))
+        else:
+            duration_seconds = int(data.get("days", 0)) * 86400
         count = max(1, min(100, int(data.get("count", 1))))
-        if not 1 <= days <= 3650:
+        if not 3600 <= duration_seconds <= 3650 * 86400:
             raise ValueError
     except (TypeError, ValueError):
-        return jsonify(error="days_must_be_1_to_3650; count_1_to_100"), 400
+        return jsonify(error="duration_must_be_1_hour_to_3650_days; count_1_to_100"), 400
 
     generated = []
     with db() as conn:
@@ -159,10 +163,10 @@ def create_licenses():
             key = "DEW-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
             conn.execute(
                 "INSERT INTO licenses(key_hash,key_hint,duration_seconds) VALUES (%s,%s,%s)",
-                (key_hash(key), key[:8] + "…" + key[-4:], days * 86400),
+                (key_hash(key), key[:8] + "…" + key[-4:], duration_seconds),
             )
             generated.append(key)
-    return jsonify(created=len(generated), days=days, keys=generated), 201
+    return jsonify(created=len(generated), duration_seconds=duration_seconds, keys=generated), 201
 
 
 @app.get("/api/v1/admin/licenses")
