@@ -39,6 +39,7 @@ def init_db():
                 activated_at TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
                 machine_id TEXT,
+                username TEXT,
                 last_seen TIMESTAMPTZ,
                 revoked_at TIMESTAMPTZ
             )
@@ -46,6 +47,7 @@ def init_db():
         # Existing installations only have hashes; the new nullable column lets
         # future keys be recoverable by the authenticated admin API.
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS encrypted_key TEXT")
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS username TEXT")
 
 
 @app.before_request
@@ -96,6 +98,7 @@ def verify_client_request(heartbeat=False):
     data = get_payload()
     key = str(data.get("key", "")).strip().upper()
     machine_id = str(data.get("machine_id", "")).strip()
+    username = str(data.get("username", "")).strip()[:80]
     if not key or len(key) > 100 or not machine_id or len(machine_id) > 128:
         return None, (jsonify(valid=False, error="invalid_request"), 400)
 
@@ -112,15 +115,19 @@ def verify_client_request(heartbeat=False):
             return None, (jsonify(valid=False, error="bound_to_another_device"), 409)
         if not row["activated_at"]:
             conn.execute(
-                "UPDATE licenses SET activated_at=%s, expires_at=%s, machine_id=%s, last_seen=%s WHERE key_hash=%s",
-                (now, now + timedelta(seconds=row["duration_seconds"]), machine_id, now, row["key_hash"]),
+                "UPDATE licenses SET activated_at=%s, expires_at=%s, machine_id=%s, last_seen=%s, username=%s WHERE key_hash=%s",
+                (now, now + timedelta(seconds=row["duration_seconds"]), machine_id, now, username or None, row["key_hash"]),
             )
             row["activated_at"] = now
             row["expires_at"] = now + timedelta(seconds=row["duration_seconds"])
             row["machine_id"] = machine_id
         elif row["expires_at"] <= now:
             return None, (jsonify(valid=False, error="expired", expires_at=row["expires_at"].isoformat()), 403)
-        conn.execute("UPDATE licenses SET last_seen=%s WHERE key_hash=%s", (now, row["key_hash"]))
+        if username:
+            conn.execute("UPDATE licenses SET last_seen=%s, username=%s WHERE key_hash=%s", (now, username, row["key_hash"]))
+            row["username"] = username
+        else:
+            conn.execute("UPDATE licenses SET last_seen=%s WHERE key_hash=%s", (now, row["key_hash"]))
         row["last_seen"] = now
         return license_result(row, now), None
 
@@ -190,7 +197,7 @@ def list_licenses():
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
-            "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, revoked_at FROM licenses ORDER BY issued_at DESC"
+            "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, revoked_at, username FROM licenses ORDER BY issued_at DESC"
         ).fetchall()
     try:
         key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
@@ -207,6 +214,7 @@ def list_licenses():
                 full_key = None
         output.append({
             "license_id": row["key_hash"], "key_hint": row["key_hint"], "key": full_key,
+            "username": row["username"],
             "duration_seconds": row["duration_seconds"], "activated_at": row["activated_at"],
             "expires_at": row["expires_at"], "online": online,
             "revoked": bool(row["revoked_at"]),
@@ -276,6 +284,25 @@ def delete_license():
         if result.rowcount == 0:
             return jsonify(error="not_found"), 404
     return jsonify(deleted=True)
+
+
+@app.post("/api/v1/admin/rename")
+def rename_license():
+    denied = require_admin()
+    if denied:
+        return denied
+    data = get_payload()
+    license_id = _admin_license_id()
+    username = str(data.get("username", "")).strip()
+    if not license_id:
+        return jsonify(error="key_required"), 400
+    if not username or len(username) > 80:
+        return jsonify(error="username_required_max_80_chars"), 400
+    with db() as conn:
+        result = conn.execute("UPDATE licenses SET username=%s WHERE key_hash=%s", (username, license_id))
+        if result.rowcount == 0:
+            return jsonify(error="not_found"), 404
+    return jsonify(updated=True, username=username)
 
 
 if __name__ == "__main__":
