@@ -172,10 +172,13 @@ def create_licenses():
         else:
             duration_seconds = int(data.get("days", 0)) * 86400
         count = max(1, min(100, int(data.get("count", 1))))
-        if not 3600 <= duration_seconds <= 3650 * 86400:
+        if duration_seconds < 3600:
             raise ValueError
     except (TypeError, ValueError):
-        return jsonify(error="duration_must_be_1_hour_to_3650_days; count_1_to_100"), 400
+        return jsonify(error="duration_must_be_at_least_1_hour; count_1_to_100"), 400
+    max_seconds = int((datetime.max.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+    if duration_seconds > max_seconds:
+        return jsonify(error="duration_exceeds_supported_calendar_range"), 400
 
     generated = []
     with db() as conn:
