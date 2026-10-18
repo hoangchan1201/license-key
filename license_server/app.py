@@ -335,5 +335,52 @@ def rename_license():
     return jsonify(updated=True, username=username)
 
 
+@app.post("/api/v1/admin/extend")
+def extend_license():
+    denied = require_admin()
+    if denied:
+        return denied
+    data = get_payload()
+    license_id = _admin_license_id()
+    try:
+        added_seconds = int(data.get("duration_seconds", 0))
+    except (TypeError, ValueError):
+        return jsonify(error="duration_must_be_at_least_1_hour"), 400
+    if not license_id:
+        return jsonify(error="key_required"), 400
+    if added_seconds < 3600:
+        return jsonify(error="duration_must_be_at_least_1_hour"), 400
+
+    now = datetime.now(timezone.utc)
+    max_seconds = int((datetime.max.replace(tzinfo=timezone.utc) - now).total_seconds())
+    if added_seconds > max_seconds:
+        return jsonify(error="duration_exceeds_supported_calendar_range"), 400
+    with db() as conn:
+        row = conn.execute(
+            "SELECT duration_seconds, activated_at, expires_at, revoked_at FROM licenses WHERE key_hash=%s FOR UPDATE",
+            (license_id,),
+        ).fetchone()
+        if not row:
+            return jsonify(error="not_found"), 404
+        if row["revoked_at"]:
+            return jsonify(error="license_revoked"), 409
+        total_seconds = int(row["duration_seconds"]) + added_seconds
+        if row["expires_at"] is None:
+            conn.execute("UPDATE licenses SET duration_seconds=%s WHERE key_hash=%s", (total_seconds, license_id))
+            expires_at = None
+        else:
+            base_expiry = max(row["expires_at"], now)
+            if added_seconds > int((datetime.max.replace(tzinfo=timezone.utc) - base_expiry).total_seconds()):
+                return jsonify(error="duration_exceeds_supported_calendar_range"), 400
+            expires_at = base_expiry + timedelta(seconds=added_seconds)
+            activated_at = row["activated_at"] or now
+            conn.execute(
+                "UPDATE licenses SET duration_seconds=%s, activated_at=%s, expires_at=%s WHERE key_hash=%s",
+                (total_seconds, activated_at, expires_at, license_id),
+            )
+    return jsonify(extended=True, added_seconds=added_seconds, duration_seconds=total_seconds,
+                   expires_at=expires_at.isoformat() if expires_at else None)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
