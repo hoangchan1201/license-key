@@ -152,6 +152,23 @@ def heartbeat():
     return error if error else jsonify(result)
 
 
+@app.post("/api/v1/offline")
+def client_offline():
+    data = get_payload()
+    key = str(data.get("key", "")).strip().upper()
+    machine_id = str(data.get("machine_id", "")).strip()
+    if not key or not machine_id:
+        return jsonify(error="invalid_request"), 400
+    with db() as conn:
+        result = conn.execute(
+            "UPDATE licenses SET last_seen=NULL, online_since=NULL WHERE key_hash=%s AND machine_id=%s",
+            (key_hash(key), machine_id),
+        )
+        if result.rowcount == 0:
+            return jsonify(error="license_or_machine_not_found"), 404
+    return jsonify(offline=True)
+
+
 def require_admin():
     if not ADMIN_TOKEN or not secrets.compare_digest(
         request.headers.get("Authorization", ""), f"Bearer {ADMIN_TOKEN}"
