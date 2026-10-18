@@ -190,7 +190,7 @@ def list_licenses():
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
-            "SELECT key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, revoked_at FROM licenses ORDER BY issued_at DESC"
+            "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, revoked_at FROM licenses ORDER BY issued_at DESC"
         ).fetchall()
     try:
         key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
@@ -206,7 +206,7 @@ def list_licenses():
             except (InvalidToken, ValueError, UnicodeError):
                 full_key = None
         output.append({
-            "key_hint": row["key_hint"], "key": full_key,
+            "license_id": row["key_hash"], "key_hint": row["key_hint"], "key": full_key,
             "duration_seconds": row["duration_seconds"], "activated_at": row["activated_at"],
             "expires_at": row["expires_at"], "online": online,
             "revoked": bool(row["revoked_at"]),
@@ -214,16 +214,32 @@ def list_licenses():
     return jsonify(licenses=output, online_window_seconds=ONLINE_WINDOW_SECONDS)
 
 
+def _admin_license_id():
+    data = get_payload()
+    license_id = str(data.get("license_id", "")).strip().lower()
+    if len(license_id) == 64 and all(char in "0123456789abcdef" for char in license_id):
+        return license_id
+    key = str(data.get("key", "")).strip().upper()
+    if key:
+        return key_hash(key)
+    key_hint = str(data.get("key_hint", "")).strip()
+    if key_hint:
+        with db() as conn:
+            row = conn.execute("SELECT key_hash FROM licenses WHERE key_hint=%s ORDER BY issued_at DESC LIMIT 1", (key_hint,)).fetchone()
+        return row["key_hash"] if row else ""
+    return ""
+
+
 @app.post("/api/v1/admin/revoke")
 def revoke_license():
     denied = require_admin()
     if denied:
         return denied
-    key = str(get_payload().get("key", "")).strip().upper()
-    if not key:
+    license_id = _admin_license_id()
+    if not license_id:
         return jsonify(error="key_required"), 400
     with db() as conn:
-        result = conn.execute("UPDATE licenses SET revoked_at=now() WHERE key_hash=%s", (key_hash(key),))
+        result = conn.execute("UPDATE licenses SET revoked_at=now() WHERE key_hash=%s", (license_id,))
         if result.rowcount == 0:
             return jsonify(error="not_found"), 404
     return jsonify(revoked=True)
@@ -234,17 +250,32 @@ def reset_license():
     denied = require_admin()
     if denied:
         return denied
-    key = str(get_payload().get("key", "")).strip().upper()
-    if not key:
+    license_id = _admin_license_id()
+    if not license_id:
         return jsonify(error="key_required"), 400
     with db() as conn:
         result = conn.execute(
             "UPDATE licenses SET activated_at=NULL, expires_at=NULL, machine_id=NULL, last_seen=NULL, revoked_at=NULL WHERE key_hash=%s",
-            (key_hash(key),),
+            (license_id,),
         )
         if result.rowcount == 0:
             return jsonify(error="not_found"), 404
     return jsonify(reset=True)
+
+
+@app.post("/api/v1/admin/delete")
+def delete_license():
+    denied = require_admin()
+    if denied:
+        return denied
+    license_id = _admin_license_id()
+    if not license_id:
+        return jsonify(error="key_required"), 400
+    with db() as conn:
+        result = conn.execute("DELETE FROM licenses WHERE key_hash=%s", (license_id,))
+        if result.rowcount == 0:
+            return jsonify(error="not_found"), 404
+    return jsonify(deleted=True)
 
 
 if __name__ == "__main__":
