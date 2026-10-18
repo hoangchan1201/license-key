@@ -40,6 +40,7 @@ def init_db():
                 expires_at TIMESTAMPTZ,
                 machine_id TEXT,
                 username TEXT,
+                online_since TIMESTAMPTZ,
                 last_seen TIMESTAMPTZ,
                 revoked_at TIMESTAMPTZ
             )
@@ -48,6 +49,8 @@ def init_db():
         # future keys be recoverable by the authenticated admin API.
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS encrypted_key TEXT")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS username TEXT")
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS online_since TIMESTAMPTZ")
+        conn.execute("UPDATE licenses SET online_since=last_seen WHERE online_since IS NULL AND last_seen IS NOT NULL")
 
 
 @app.before_request
@@ -113,10 +116,11 @@ def verify_client_request(heartbeat=False):
             return None, (jsonify(valid=False, error="revoked"), 403)
         if row["machine_id"] and row["machine_id"] != machine_id:
             return None, (jsonify(valid=False, error="bound_to_another_device"), 409)
+        new_online_session = not row["last_seen"] or (now - row["last_seen"]).total_seconds() > ONLINE_WINDOW_SECONDS
         if not row["activated_at"]:
             conn.execute(
-                "UPDATE licenses SET activated_at=%s, expires_at=%s, machine_id=%s, last_seen=%s, username=%s WHERE key_hash=%s",
-                (now, now + timedelta(seconds=row["duration_seconds"]), machine_id, now, username or None, row["key_hash"]),
+                "UPDATE licenses SET activated_at=%s, expires_at=%s, machine_id=%s, last_seen=%s, online_since=%s, username=%s WHERE key_hash=%s",
+                (now, now + timedelta(seconds=row["duration_seconds"]), machine_id, now, now, username or None, row["key_hash"]),
             )
             row["activated_at"] = now
             row["expires_at"] = now + timedelta(seconds=row["duration_seconds"])
@@ -124,10 +128,14 @@ def verify_client_request(heartbeat=False):
         elif row["expires_at"] <= now:
             return None, (jsonify(valid=False, error="expired", expires_at=row["expires_at"].isoformat()), 403)
         if username:
-            conn.execute("UPDATE licenses SET last_seen=%s, username=%s WHERE key_hash=%s", (now, username, row["key_hash"]))
+            conn.execute("UPDATE licenses SET last_seen=%s, online_since=CASE WHEN %s THEN %s ELSE online_since END, username=%s WHERE key_hash=%s",
+                         (now, new_online_session, now, username, row["key_hash"]))
             row["username"] = username
         else:
-            conn.execute("UPDATE licenses SET last_seen=%s WHERE key_hash=%s", (now, row["key_hash"]))
+            conn.execute("UPDATE licenses SET last_seen=%s, online_since=CASE WHEN %s THEN %s ELSE online_since END WHERE key_hash=%s",
+                         (now, new_online_session, now, row["key_hash"]))
+        if new_online_session:
+            row["online_since"] = now
         row["last_seen"] = now
         return license_result(row, now), None
 
@@ -200,7 +208,7 @@ def list_licenses():
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
-            "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, revoked_at, username FROM licenses ORDER BY issued_at DESC"
+            "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, online_since, revoked_at, username FROM licenses ORDER BY issued_at DESC"
         ).fetchall()
     try:
         key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
@@ -209,6 +217,7 @@ def list_licenses():
     output = []
     for row in rows:
         online = bool(row["last_seen"] and (now - row["last_seen"]).total_seconds() <= ONLINE_WINDOW_SECONDS and not row["revoked_at"] and (not row["expires_at"] or row["expires_at"] > now))
+        online_seconds = max(0, int((now - row["online_since"]).total_seconds())) if online and row["online_since"] else 0
         full_key = None
         if row["encrypted_key"] and key_cipher:
             try:
@@ -218,6 +227,7 @@ def list_licenses():
         output.append({
             "license_id": row["key_hash"], "key_hint": row["key_hint"], "key": full_key,
             "username": row["username"],
+            "online_seconds": online_seconds,
             "duration_seconds": row["duration_seconds"], "activated_at": row["activated_at"],
             "expires_at": row["expires_at"], "online": online,
             "revoked": bool(row["revoked_at"]),
@@ -266,7 +276,7 @@ def reset_license():
         return jsonify(error="key_required"), 400
     with db() as conn:
         result = conn.execute(
-            "UPDATE licenses SET activated_at=NULL, expires_at=NULL, machine_id=NULL, last_seen=NULL, revoked_at=NULL WHERE key_hash=%s",
+            "UPDATE licenses SET activated_at=NULL, expires_at=NULL, machine_id=NULL, online_since=NULL, last_seen=NULL, revoked_at=NULL WHERE key_hash=%s",
             (license_id,),
         )
         if result.rowcount == 0:
