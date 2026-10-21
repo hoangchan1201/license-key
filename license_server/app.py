@@ -85,6 +85,7 @@ def license_result(row, now=None):
         "expires_at": expires.isoformat() if expires else None,
         "seconds_left": remaining,
         "server_time": now.isoformat(),
+        "username": row.get("username"),
     }
 
 
@@ -120,6 +121,8 @@ def verify_client_request(heartbeat=False):
             return None, (jsonify(valid=False, error="bound_to_another_device"), 409)
         new_online_session = not row["last_seen"] or (now - row["last_seen"]).total_seconds() > ONLINE_WINDOW_SECONDS
         if not row["activated_at"]:
+            if not username:
+                return None, (jsonify(valid=False, error="username_required"), 400)
             conn.execute(
                 "UPDATE licenses SET activated_at=%s, expires_at=%s, machine_id=%s, last_seen=%s, online_since=%s, offline_at=NULL, username=%s WHERE key_hash=%s",
                 (now, now + timedelta(seconds=row["duration_seconds"]), machine_id, now, now, username or None, row["key_hash"]),
@@ -127,15 +130,11 @@ def verify_client_request(heartbeat=False):
             row["activated_at"] = now
             row["expires_at"] = now + timedelta(seconds=row["duration_seconds"])
             row["machine_id"] = machine_id
+            row["username"] = username
         elif row["expires_at"] <= now:
             return None, (jsonify(valid=False, error="expired", expires_at=row["expires_at"].isoformat()), 403)
-        if username:
-            conn.execute("UPDATE licenses SET last_seen=%s, online_since=CASE WHEN %s THEN %s ELSE online_since END, offline_at=CASE WHEN %s THEN NULL ELSE offline_at END, username=%s WHERE key_hash=%s",
-                         (now, new_online_session, now, new_online_session, username, row["key_hash"]))
-            row["username"] = username
-        else:
-            conn.execute("UPDATE licenses SET last_seen=%s, online_since=CASE WHEN %s THEN %s ELSE online_since END, offline_at=CASE WHEN %s THEN NULL ELSE offline_at END WHERE key_hash=%s",
-                         (now, new_online_session, now, new_online_session, row["key_hash"]))
+        conn.execute("UPDATE licenses SET last_seen=%s, online_since=CASE WHEN %s THEN %s ELSE online_since END, offline_at=CASE WHEN %s THEN NULL ELSE offline_at END WHERE key_hash=%s",
+                     (now, new_online_session, now, new_online_session, row["key_hash"]))
         if new_online_session:
             row["online_since"] = now
         row["last_seen"] = now
