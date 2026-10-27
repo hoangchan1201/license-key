@@ -23,6 +23,7 @@ API này thay cho bước xác thực license offline sau khi đã deploy và c�
 4. Ở phần **Environment Variables**, thêm:
    - `DATABASE_URL`: connection string lấy từ Neon.
    - `LICENSE_ADMIN_TOKEN`: tạo chuỗi bí mật dài, ngẫu nhiên và giữ riêng.
+   - `LICENSE_KEY_ENCRYPTION_KEY`: sau khi cập nhật server, tạo key Fernet bằng `py -m pip install cryptography` rồi chạy `py -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`; lưu kết quả vào biến này trên Render. Giữ bí mật và sao lưu an toàn; không đổi/mất key này nếu muốn xem lại license key đầy đủ.
 5. Deploy. Mở URL service kèm `/health`; phải thấy `{"ok":true,...}`. URL sẽ có dạng `https://ten-service.onrender.com`.
 
 > Render Free có thể sleep sau 15 phút không có request; lần gọi đầu sau sleep sẽ khởi động lại. Không dùng Render Free PostgreSQL cho license lâu dài vì database miễn phí hết hạn sau 30 ngày. API service chỉ lưu dữ liệu trong Neon.
@@ -32,13 +33,24 @@ API này thay cho bước xác thực license offline sau khi đã deploy và c�
 Trên máy quản trị, mở PowerShell tại thư mục `license_server`:
 
 ```powershell
-$env:LICENSE_API_BASE_URL = "https://ten-service.onrender.com"
-$env:LICENSE_ADMIN_TOKEN = "TOKEN_BI_MAT_CUA_BAN"
-py -m pip install -r requirements.txt
 py admin_cli.py create --days 30 --count 1
 ```
 
+Lần chạy đầu tiên, chương trình hỏi `LICENSE_ADMIN_TOKEN` rồi lưu token đã mã hóa bằng Windows cho tài khoản hiện tại. Nếu cần nhập/lưu lại token, chạy `py admin_cli.py set-token`. Lưu ý token sẽ hiện trên màn hình khi nhập. Những lần sau không cần nhập lại. URL API đã được đặt sẵn; có thể ghi đè bằng `--url` nếu đổi server. Không đưa token lên GitHub.
+
 Key hiện ra chỉ một lần; hãy lưu an toàn rồi gửi key cho đúng người dùng. Ví dụ tạo key 7 ngày: `--days 7`. Lần kích hoạt đầu tiên mới bắt đầu tính thời hạn.
+
+Thời hạn được chọn theo một đơn vị mỗi lần; tháng tính 30 ngày, năm tính 365 ngày. Mức hỗ trợ từ 1 giờ đến 3650 ngày:
+
+```powershell
+py admin_cli.py create --hours 3 --count 1
+py admin_cli.py create --days 2 --count 1
+py admin_cli.py create --weeks 2 --count 1
+py admin_cli.py create --months 1 --count 1
+py admin_cli.py create --years 1 --count 1
+```
+
+API trên Render phải được cập nhật/redeploy trước khi dùng `--hours`. Thời hạn tròn ngày (ngày/tuần/tháng/năm) vẫn dùng được với bản server cũ.
 
 ## 5. Xem ai đang online / thu hồi key
 
@@ -48,11 +60,13 @@ py admin_cli.py revoke --key "DEW-..."
 py admin_cli.py reset --key "DEW-..."
 ```
 
-`list` hiển thị key đã che một phần, hạn và online/offline. Online nghĩa là server nhận heartbeat trong vòng 100 giây. `reset` xóa liên kết máy và ngày kích hoạt; lần dùng tiếp theo bắt đầu lại thời hạn, nên chỉ dùng khi cần hỗ trợ đổi máy.
+`list` hiển thị key đã che một phần, hạn và online/offline. Online nghĩa là server nhận heartbeat trong vòng 100 giây. Bản server mới mã hóa key để admin có thể xem/copy lại. Các key cũ chỉ lưu hash nên không thể khôi phục nội dung đầy đủ. `reset` xóa liên kết máy và ngày kích hoạt; lần dùng tiếp theo bắt đầu lại thời hạn, nên chỉ dùng khi cần hỗ trợ đổi máy.
+
+Dialog **Quản lý License — Admin** cũng hỗ trợ giảm cùng một khoảng thời hạn cho một hoặc nhiều key đã chọn. Mỗi key phải còn ít nhất 1 giờ sau khi trừ; nếu bất kỳ key nào không hợp lệ hoặc không đủ thời hạn, cả lô sẽ bị từ chối. Tính năng này cần deploy phiên bản server có endpoint `/api/v1/admin/reduce` trước khi dùng.
 
 ## 6. Kết nối launcher
 
-Sau khi `/health` hoạt động, cần cập nhật `LICENSE_API_BASE_URL` trong `license_client_api.py` bằng URL Render, rồi chuyển import license ở `launcher_auto_tool.py` từ `license_client_offline` sang `license_client_api` và build lại. Chưa chuyển launcher trước khi có URL API thật, nếu không bản hiện tại sẽ không xác thực được license.
+Sau khi `/health` hoạt động, client ở thư mục mã nguồn đã được nối tới URL Render và launcher đã chuyển sang `license_client_api`. Hãy build lại launcher để phát hành bản dùng API.
 
 ## Lưu ý
 
