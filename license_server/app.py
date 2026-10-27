@@ -396,5 +396,80 @@ def extend_license():
                    expires_at=expires_at.isoformat() if expires_at else None)
 
 
+@app.post("/api/v1/admin/reduce")
+def reduce_licenses():
+    """Subtract one duration from one or more licenses atomically."""
+    denied = require_admin()
+    if denied:
+        return denied
+    data = get_payload()
+    try:
+        reduce_seconds = int(data.get("duration_seconds", 0))
+    except (TypeError, ValueError):
+        return jsonify(error="duration_must_be_at_least_1_hour"), 400
+    if reduce_seconds < 3600:
+        return jsonify(error="duration_must_be_at_least_1_hour"), 400
+
+    raw_ids = data.get("license_ids")
+    if raw_ids is None:
+        single_id = _admin_license_id()
+        raw_ids = [single_id] if single_id else []
+    if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 100:
+        return jsonify(error="license_ids_required_max_100"), 400
+    license_ids = []
+    for value in raw_ids:
+        license_id = str(value or "").strip().lower()
+        if len(license_id) != 64 or any(char not in "0123456789abcdef" for char in license_id):
+            return jsonify(error="invalid_license_id"), 400
+        if license_id not in license_ids:
+            license_ids.append(license_id)
+
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        records = []
+        # Validate the whole batch before writing anything so an invalid or
+        # too-short key cannot leave the rest of the selection partially changed.
+        for license_id in license_ids:
+            row = conn.execute(
+                "SELECT duration_seconds, expires_at, revoked_at FROM licenses WHERE key_hash=%s FOR UPDATE",
+                (license_id,),
+            ).fetchone()
+            if not row:
+                return jsonify(error="not_found", license_id=license_id), 404
+            if row["revoked_at"]:
+                return jsonify(error="license_revoked", license_id=license_id), 409
+            current_duration = int(row["duration_seconds"])
+            if current_duration - reduce_seconds < 3600:
+                return jsonify(error="reduction_would_leave_less_than_1_hour",
+                               license_id=license_id), 400
+            records.append((license_id, row, current_duration - reduce_seconds))
+
+        results = []
+        for license_id, row, new_duration in records:
+            expires_at = row["expires_at"]
+            if expires_at is not None:
+                expires_at = max(now, expires_at - timedelta(seconds=reduce_seconds))
+                conn.execute(
+                    "UPDATE licenses SET duration_seconds=%s, expires_at=%s, "
+                    "offline_at=CASE WHEN %s <= %s THEN COALESCE(offline_at, %s) ELSE offline_at END, "
+                    "last_seen=CASE WHEN %s <= %s THEN NULL ELSE last_seen END, "
+                    "online_since=CASE WHEN %s <= %s THEN NULL ELSE online_since END "
+                    "WHERE key_hash=%s",
+                    (new_duration, expires_at, expires_at, now, now,
+                     expires_at, now, expires_at, now, license_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE licenses SET duration_seconds=%s WHERE key_hash=%s",
+                    (new_duration, license_id),
+                )
+            results.append({
+                "license_id": license_id,
+                "duration_seconds": new_duration,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+            })
+    return jsonify(reduced=len(results), reduced_seconds=reduce_seconds, licenses=results)
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
