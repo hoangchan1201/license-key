@@ -64,7 +64,7 @@ py admin_cli.py reset --key "DEW-..."
 
 Dialog **Quản lý License — Admin** cũng hỗ trợ giảm cùng một khoảng thời hạn cho một hoặc nhiều key đã chọn. Mỗi key phải còn ít nhất 1 giờ sau khi trừ; nếu bất kỳ key nào không hợp lệ hoặc không đủ thời hạn, cả lô sẽ bị từ chối. Tính năng này cần deploy phiên bản server có endpoint `/api/v1/admin/reduce` trước khi dùng.
 
-Nút **Key miễn phí** trong License Admin tạo một lô key miễn phí chưa kích hoạt. Người dùng bấm **Get key free** để nhận trực tiếp một key chưa kích hoạt; server khóa key cho đúng một machine ID và trả lại cùng key đó nếu máy ấy yêu cầu lại trước khi kích hoạt. Luồng này không dùng CAPTCHA. Tính năng cần cột `is_free` và endpoint `/api/v1/free-key`; schema tự bổ sung khi server khởi động.
+Nút **Key miễn phí** trong License Admin tạo và quản lý kho key miễn phí; key miễn phí chỉ hiển thị trong dialog này, không xuất hiện trong bảng license thường. Người dùng bấm **Get key free** để nhận key; server chỉ cho mỗi machine ID giữ một key miễn phí còn hạn và trả lại đúng key đó nếu yêu cầu lại. Key free đã kích hoạt sẽ bị xóa khi hết hạn (dọn tối đa mỗi phút khi API đang hoạt động, đồng thời dọn lúc xem kho hoặc yêu cầu key). Khi kho chưa kích hoạt đã hết, endpoint tự tạo và cấp ngay một key miễn phí thời hạn 1 giờ. API này không dùng CAPTCHA. Tính năng cần cột `is_free` và endpoint `/api/v1/free-key`; schema tự bổ sung khi server khởi động.
 
 ## 6. Kết nối launcher
 
