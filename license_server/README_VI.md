@@ -64,6 +64,8 @@ py admin_cli.py reset --key "DEW-..."
 
 Dialog **Quản lý License — Admin** cũng hỗ trợ giảm cùng một khoảng thời hạn cho một hoặc nhiều key đã chọn. Mỗi key phải còn ít nhất 1 giờ sau khi trừ; nếu bất kỳ key nào không hợp lệ hoặc không đủ thời hạn, cả lô sẽ bị từ chối. Tính năng này cần deploy phiên bản server có endpoint `/api/v1/admin/reduce` trước khi dùng.
 
+Nút **Key miễn phí** trong License Admin tạo một lô key miễn phí chưa kích hoạt. Người dùng bấm **Get key free**, nhập mã trong ảnh CAPTCHA do server tạo và được server xác minh, sau đó server khóa key cho đúng một máy. CAPTCHA hết hạn sau 5 phút và tối đa 3 lần nhập sai. Server giới hạn tối đa 8 CAPTCHA trong 10 phút trên mỗi machine ID. Tính năng này cần deploy phiên bản server có cột `is_free`, bảng `free_key_captchas`, Pillow và các endpoint `/api/v1/free-key/captcha` cùng `/api/v1/free-key`; schema tự bổ sung khi server khởi động. Đây là CAPTCHA cơ bản để cản yêu cầu tự động đơn giản, không thay thế dịch vụ chống bot chuyên dụng.
+
 ## 6. Kết nối launcher
 
 Sau khi `/health` hoạt động, client ở thư mục mã nguồn đã được nối tới URL Render và launcher đã chuyển sang `license_client_api`. Hãy build lại launcher để phát hành bản dùng API.
