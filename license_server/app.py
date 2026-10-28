@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -53,6 +54,10 @@ def init_db():
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS online_since TIMESTAMPTZ")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS offline_at TIMESTAMPTZ")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_free_license_expiry "
+            "ON licenses(expires_at) WHERE is_free=TRUE AND expires_at IS NOT NULL"
+        )
         conn.execute("UPDATE licenses SET online_since=last_seen WHERE online_since IS NULL AND last_seen IS NOT NULL")
 @app.before_request
 def ensure_schema():
@@ -74,6 +79,36 @@ def database_request_timeout(_error):
 
 def key_hash(key: str) -> str:
     return hashlib.sha256(key.strip().upper().encode("utf-8")).hexdigest()
+
+
+def _cleanup_expired_free_keys(conn):
+    """Remove expired free licenses."""
+    result = conn.execute(
+        "DELETE FROM licenses WHERE is_free=TRUE AND expires_at IS NOT NULL AND expires_at <= now()"
+    )
+    return result.rowcount
+
+
+_LAST_FREE_CLEANUP = 0.0
+_FREE_CLEANUP_LOCK = threading.Lock()
+
+
+@app.before_request
+def periodically_cleanup_expired_free_keys():
+    """Clean expired free keys at most once per minute while API is active."""
+    global _LAST_FREE_CLEANUP
+    if not _SCHEMA_READY or time.monotonic() - _LAST_FREE_CLEANUP < 60:
+        return
+    with _FREE_CLEANUP_LOCK:
+        if time.monotonic() - _LAST_FREE_CLEANUP < 60:
+            return
+        try:
+            with db() as conn:
+                conn.execute("SET LOCAL statement_timeout = '10s'")
+                _cleanup_expired_free_keys(conn)
+            _LAST_FREE_CLEANUP = time.monotonic()
+        except Exception:
+            app.logger.exception("Periodic cleanup of expired free keys failed")
 
 
 def get_payload():
@@ -244,25 +279,40 @@ def claim_free_key():
         # query or row lock.
         conn.execute("SET LOCAL lock_timeout = '8s'")
         conn.execute("SET LOCAL statement_timeout = '15s'")
+        _cleanup_expired_free_keys(conn)
         # Serialize simultaneous requests from the same device so it cannot
         # reserve multiple free keys through overlapping clicks/retries.
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (machine_id,))
-        # If the client lost the response or closed before activating, return
-        # the same reservation to that device rather than consuming another key.
+        # Reuse this machine's still-valid free key. A new key becomes available
+        # after the current key expires and is removed above.
         row = conn.execute(
             "SELECT key_hash, encrypted_key FROM licenses "
-            "WHERE is_free=TRUE AND machine_id=%s AND activated_at IS NULL AND revoked_at IS NULL "
-            "ORDER BY issued_at LIMIT 1 FOR UPDATE",
+            "WHERE is_free=TRUE AND machine_id=%s AND revoked_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > now()) "
+            "ORDER BY issued_at DESC LIMIT 1 FOR UPDATE",
             (machine_id,),
         ).fetchone()
         if row is None:
+            # Serialize pool depletion so concurrent users cannot all observe
+            # an empty stock and create unnecessary keys.
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext('free-key-stock'))")
+            _cleanup_expired_free_keys(conn)
             row = conn.execute(
                 "SELECT key_hash, encrypted_key FROM licenses "
                 "WHERE is_free=TRUE AND machine_id IS NULL AND activated_at IS NULL AND revoked_at IS NULL "
                 "ORDER BY issued_at, key_hash LIMIT 1 FOR UPDATE SKIP LOCKED"
             ).fetchone()
             if row is None:
-                return jsonify(error="free_keys_unavailable"), 404
+                # No prepared free keys remain: replenish on demand with one
+                # one-hour key and reserve it directly for this requester.
+                key = "DEW-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
+                encrypted = key_cipher.encrypt(key.encode("utf-8")).decode("ascii")
+                conn.execute(
+                    "INSERT INTO licenses(key_hash,key_hint,encrypted_key,duration_seconds,"
+                    "is_free,machine_id) VALUES (%s,%s,%s,3600,TRUE,%s)",
+                    (key_hash(key), key[:8] + "…" + key[-4:], encrypted, machine_id),
+                )
+                return jsonify(key=key, reserved=True, generated=True, duration_seconds=3600)
             conn.execute(
                 "UPDATE licenses SET machine_id=%s WHERE key_hash=%s AND machine_id IS NULL",
                 (machine_id, row["key_hash"]),
@@ -273,7 +323,7 @@ def claim_free_key():
             key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
         except (InvalidToken, ValueError, UnicodeError):
             return jsonify(error="free_key_unavailable"), 503
-    return jsonify(key=key, reserved=True)
+    return jsonify(key=key, reserved=True, generated=False)
 
 
 @app.get("/api/v1/admin/licenses")
@@ -283,8 +333,9 @@ def list_licenses():
         return denied
     now = datetime.now(timezone.utc)
     with db() as conn:
+        _cleanup_expired_free_keys(conn)
         rows = conn.execute(
-            "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, online_since, offline_at, revoked_at, username FROM licenses ORDER BY issued_at DESC"
+            "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, online_since, offline_at, revoked_at, username FROM licenses WHERE COALESCE(is_free,FALSE)=FALSE ORDER BY issued_at DESC"
         ).fetchall()
     try:
         key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
@@ -322,6 +373,50 @@ def list_licenses():
             "revoked": bool(row["revoked_at"]),
         })
     return jsonify(licenses=output, online_window_seconds=ONLINE_WINDOW_SECONDS)
+
+
+@app.get("/api/v1/admin/free-keys")
+def list_free_licenses():
+    denied = require_admin()
+    if denied:
+        return denied
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        _cleanup_expired_free_keys(conn)
+        rows = conn.execute(
+            "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,"
+            "activated_at,expires_at,machine_id,revoked_at FROM licenses "
+            "WHERE is_free=TRUE ORDER BY issued_at DESC"
+        ).fetchall()
+    try:
+        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
+    except Exception:
+        key_cipher = None
+    output = []
+    for row in rows:
+        key = None
+        if row["encrypted_key"] and key_cipher:
+            try:
+                key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
+            except (InvalidToken, ValueError, UnicodeError):
+                pass
+        expires_at = row["expires_at"]
+        if row["revoked_at"]:
+            status = "Đã thu hồi"
+        elif row["activated_at"]:
+            status = "Đang dùng"
+        elif row["machine_id"]:
+            status = "Đã giữ — chờ kích hoạt"
+        else:
+            status = "Chưa dùng"
+        output.append({
+            "license_id": row["key_hash"], "key": key, "key_hint": row["key_hint"],
+            "duration_seconds": row["duration_seconds"], "issued_at": row["issued_at"],
+            "activated_at": row["activated_at"], "expires_at": expires_at,
+            "seconds_left": max(0, int((expires_at - now).total_seconds())) if expires_at else None,
+            "status": status,
+        })
+    return jsonify(licenses=output, deleted_expired=True)
 
 
 def _admin_license_id():
