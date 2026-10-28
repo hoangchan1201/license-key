@@ -18,6 +18,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_TOKEN = os.environ.get("LICENSE_ADMIN_TOKEN", "")
 LICENSE_KEY_ENCRYPTION_KEY = os.environ.get("LICENSE_KEY_ENCRYPTION_KEY", "")
 ONLINE_WINDOW_SECONDS = 100
+MINIMUM_CLIENT_VERSION = os.environ.get("MINIMUM_CLIENT_VERSION", "1.0.25").strip().lstrip("vV")
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
 
@@ -142,6 +143,15 @@ def health():
 
 
 def verify_client_request(heartbeat=False):
+    client_version = str(request.headers.get("X-Client-Version", "")).strip().lstrip("vV")
+    if not _client_version_is_supported(client_version):
+        return None, (jsonify(
+            valid=False,
+            error="update_required",
+            minimum_version=MINIMUM_CLIENT_VERSION,
+            message=f"Please update DewTool to version {MINIMUM_CLIENT_VERSION} or newer.",
+        ), 426)
+
     data = get_payload()
     key = str(data.get("key", "")).strip().upper()
     machine_id = str(data.get("machine_id", "")).strip()
@@ -180,6 +190,22 @@ def verify_client_request(heartbeat=False):
             row["online_since"] = now
         row["last_seen"] = now
         return license_result(row, now), None
+
+
+def _client_version_is_supported(version):
+    """Reject clients that omit a version or are below the configured floor."""
+    import re
+
+    def parts(value):
+        found = re.findall(r"\d+", str(value or ""))
+        return tuple(int(item) for item in found) if found else ()
+
+    current = parts(version)
+    minimum = parts(MINIMUM_CLIENT_VERSION)
+    if not current or not minimum:
+        return False
+    width = max(len(current), len(minimum))
+    return current + (0,) * (width - len(current)) >= minimum + (0,) * (width - len(minimum))
 
 
 @app.post("/api/v1/activate")
