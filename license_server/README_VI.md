@@ -24,7 +24,8 @@ API này thay cho bước xác thực license offline sau khi đã deploy và c�
    - `DATABASE_URL`: connection string lấy từ Neon.
    - `LICENSE_ADMIN_TOKEN`: tạo chuỗi bí mật dài, ngẫu nhiên và giữ riêng.
    - `LICENSE_KEY_ENCRYPTION_KEY`: sau khi cập nhật server, tạo key Fernet bằng `py -m pip install cryptography` rồi chạy `py -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`; lưu kết quả vào biến này trên Render. Giữ bí mật và sao lưu an toàn; không đổi/mất key này nếu muốn xem lại license key đầy đủ.
-5. Deploy. Mở URL service kèm `/health`; phải thấy `{"ok":true,...}`. URL sẽ có dạng `https://ten-service.onrender.com`.
+   - `MINIMUM_CLIENT_VERSION`: phiên bản tối thiểu được phép dùng, hiện đặt `1.0.25`. Client không gửi phiên bản hoặc gửi phiên bản thấp hơn sẽ bị từ chối ở kích hoạt và heartbeat (HTTP 426).
+5. Trước khi đặt ngưỡng bắt buộc, hãy build DewTool `1.0.25`, tải ZIP lên release `DewTool-Updates` (asset cập nhật cần đúng quy ước tên trong launcher), rồi kiểm tra bản mới chạy được. Sau đó đặt `MINIMUM_CLIENT_VERSION=1.0.25` trong Render và deploy server. Mở URL service kèm `/health`; phải thấy `{"ok":true,...}`. Bản cũ không gửi header phiên bản sẽ bị chặn ngay ở lần kích hoạt/heartbeat kế tiếp.
 
 > Render Free có thể sleep sau 15 phút không có request; lần gọi đầu sau sleep sẽ khởi động lại. Không dùng Render Free PostgreSQL cho license lâu dài vì database miễn phí hết hạn sau 30 ngày. API service chỉ lưu dữ liệu trong Neon.
 
