@@ -419,6 +419,25 @@ def list_free_licenses():
     return jsonify(licenses=output, deleted_expired=True)
 
 
+@app.post("/api/v1/admin/free-keys/delete")
+def delete_free_license():
+    denied = require_admin()
+    if denied:
+        return denied
+    data = get_payload()
+    license_id = str(data.get("license_id", "")).strip().lower()
+    if len(license_id) != 64 or any(char not in "0123456789abcdef" for char in license_id):
+        return jsonify(error="license_id_required"), 400
+    with db() as conn:
+        result = conn.execute(
+            "DELETE FROM licenses WHERE key_hash=%s AND is_free=TRUE",
+            (license_id,),
+        )
+        if result.rowcount == 0:
+            return jsonify(error="free_key_not_found"), 404
+    return jsonify(deleted=True)
+
+
 def _admin_license_id():
     data = get_payload()
     license_id = str(data.get("license_id", "")).strip().lower()
