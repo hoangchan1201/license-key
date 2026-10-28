@@ -64,7 +64,7 @@ py admin_cli.py reset --key "DEW-..."
 
 Dialog **Quản lý License — Admin** cũng hỗ trợ giảm cùng một khoảng thời hạn cho một hoặc nhiều key đã chọn. Mỗi key phải còn ít nhất 1 giờ sau khi trừ; nếu bất kỳ key nào không hợp lệ hoặc không đủ thời hạn, cả lô sẽ bị từ chối. Tính năng này cần deploy phiên bản server có endpoint `/api/v1/admin/reduce` trước khi dùng.
 
-Nút **Key miễn phí** trong License Admin tạo một lô key miễn phí chưa kích hoạt. Người dùng bấm **Get key free**, nhập mã trong ảnh CAPTCHA do server tạo và được server xác minh, sau đó server khóa key cho đúng một máy. CAPTCHA hết hạn sau 5 phút và tối đa 3 lần nhập sai. Server giới hạn tối đa 8 CAPTCHA trong 10 phút trên mỗi machine ID. Tính năng này cần deploy phiên bản server có cột `is_free`, bảng `free_key_captchas`, Pillow và các endpoint `/api/v1/free-key/captcha` cùng `/api/v1/free-key`; schema tự bổ sung khi server khởi động. Đây là CAPTCHA cơ bản để cản yêu cầu tự động đơn giản, không thay thế dịch vụ chống bot chuyên dụng.
+Nút **Key miễn phí** trong License Admin tạo một lô key miễn phí chưa kích hoạt. Người dùng bấm **Get key free** để nhận trực tiếp một key chưa kích hoạt; server khóa key cho đúng một machine ID và trả lại cùng key đó nếu máy ấy yêu cầu lại trước khi kích hoạt. Luồng này không dùng CAPTCHA. Tính năng cần cột `is_free` và endpoint `/api/v1/free-key`; schema tự bổ sung khi server khởi động.
 
 ## 6. Kết nối launcher
 
@@ -75,4 +75,3 @@ Sau khi `/health` hoạt động, client ở thư mục mã nguồn đã đượ
 - Các key tạo bằng `keygen_offline.py` không tự có trong database API. Muốn chuyển người dùng hiện tại, cần cấp key API mới hoặc chuẩn bị quy trình nhập/migrate key có kiểm soát.
 - Không nhúng `LICENSE_ADMIN_TOKEN` vào launcher. Chỉ đặt token trong Environment Variables của Render và PowerShell riêng trên máy quản trị.
 - Free web service có thể khởi động chậm sau idle; khi API không truy cập được, client chưa thể xác thực key.
-
