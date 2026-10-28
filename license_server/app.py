@@ -81,6 +81,13 @@ def ensure_schema():
                 _SCHEMA_READY = True
 
 
+@app.errorhandler(psycopg.errors.QueryCanceled)
+@app.errorhandler(psycopg.errors.LockNotAvailable)
+def database_request_timeout(_error):
+    app.logger.warning("Free-key request stopped by database timeout")
+    return jsonify(error="server_busy"), 503
+
+
 def key_hash(key: str) -> str:
     return hashlib.sha256(key.strip().upper().encode("utf-8")).hexdigest()
 
@@ -241,6 +248,8 @@ def issue_free_key_captcha():
     if not machine_id or len(machine_id) > 128:
         return jsonify(error="invalid_request"), 400
     with db() as conn:
+        conn.execute("SET LOCAL lock_timeout = '8s'")
+        conn.execute("SET LOCAL statement_timeout = '15s'")
         recent = conn.execute(
             "SELECT COUNT(*) AS n FROM free_key_captchas "
             "WHERE machine_id=%s AND expires_at > now() - INTERVAL '10 minutes'",
@@ -304,6 +313,10 @@ def claim_free_key():
         return jsonify(error="key_encryption_configuration_invalid"), 503
 
     with db() as conn:
+        # Avoid leaving CAPTCHA verification waiting indefinitely on a
+        # database query or row lock. The client has a matching hard deadline.
+        conn.execute("SET LOCAL lock_timeout = '8s'")
+        conn.execute("SET LOCAL statement_timeout = '15s'")
         challenge = conn.execute(
             "SELECT * FROM free_key_captchas WHERE challenge_id=%s FOR UPDATE",
             (challenge_id,),
@@ -609,4 +622,3 @@ def reduce_licenses():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
-
