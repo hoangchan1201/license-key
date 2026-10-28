@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import base64
+import io
 import os
 import secrets
 import threading
 from datetime import datetime, timedelta, timezone
 
 import psycopg
+from PIL import Image, ImageDraw, ImageFont
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, jsonify, request
 from psycopg.rows import dict_row
@@ -50,9 +54,20 @@ def init_db():
         # future keys be recoverable by the authenticated admin API.
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS encrypted_key TEXT")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS username TEXT")
+        conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS online_since TIMESTAMPTZ")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS offline_at TIMESTAMPTZ")
         conn.execute("UPDATE licenses SET online_since=last_seen WHERE online_since IS NULL AND last_seen IS NOT NULL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS free_key_captchas (
+                challenge_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                answer_hash TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                used_at TIMESTAMPTZ
+            )
+        """)
 
 
 @app.before_request
@@ -211,11 +226,132 @@ def create_licenses():
         for _ in range(count):
             key = "DEW-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
             conn.execute(
-                "INSERT INTO licenses(key_hash,key_hint,encrypted_key,duration_seconds) VALUES (%s,%s,%s,%s)",
-                (key_hash(key), key[:8] + "…" + key[-4:], key_cipher.encrypt(key.encode("utf-8")).decode("ascii"), duration_seconds),
+                "INSERT INTO licenses(key_hash,key_hint,encrypted_key,duration_seconds,is_free) VALUES (%s,%s,%s,%s,%s)",
+                (key_hash(key), key[:8] + "…" + key[-4:], key_cipher.encrypt(key.encode("utf-8")).decode("ascii"), duration_seconds, bool(data.get("free", False))),
             )
             generated.append(key)
     return jsonify(created=len(generated), duration_seconds=duration_seconds, keys=generated), 201
+
+
+@app.post("/api/v1/free-key/captcha")
+def issue_free_key_captcha():
+    """Issue a short-lived image CAPTCHA challenge for a free-key claim."""
+    data = get_payload()
+    machine_id = str(data.get("machine_id", "")).strip()
+    if not machine_id or len(machine_id) > 128:
+        return jsonify(error="invalid_request"), 400
+    with db() as conn:
+        recent = conn.execute(
+            "SELECT COUNT(*) AS n FROM free_key_captchas "
+            "WHERE machine_id=%s AND expires_at > now() - INTERVAL '10 minutes'",
+            (machine_id,),
+        ).fetchone()["n"]
+        if recent >= 8:
+            return jsonify(error="captcha_rate_limited"), 429
+        # Keep the challenge table small without requiring an external scheduler.
+        conn.execute("DELETE FROM free_key_captchas WHERE expires_at < now() - INTERVAL '1 day'")
+        challenge_id = secrets.token_urlsafe(24)
+        alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+        answer = "".join(secrets.choice(alphabet) for _ in range(5))
+        answer_hash = hashlib.sha256(f"{challenge_id}:{machine_id}:{answer}".encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO free_key_captchas(challenge_id,machine_id,answer_hash,expires_at) "
+            "VALUES (%s,%s,%s,now() + INTERVAL '5 minutes')",
+            (challenge_id, machine_id, answer_hash),
+        )
+    image = Image.new("RGB", (190, 62), (242, 244, 247))
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 34)
+    except Exception:
+        try:
+            font = ImageFont.load_default(size=34)
+        except TypeError:
+            font = ImageFont.load_default()
+    for _ in range(7):
+        draw.line(
+            (secrets.randbelow(190), secrets.randbelow(62), secrets.randbelow(190), secrets.randbelow(62)),
+            fill=(secrets.randbelow(150), secrets.randbelow(150), secrets.randbelow(150)), width=1,
+        )
+    x = 12
+    for char in answer:
+        y = secrets.randbelow(12) + 7
+        draw.text((x, y), char, font=font,
+                  fill=(secrets.randbelow(90), secrets.randbelow(90), secrets.randbelow(90)))
+        x += 34
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    captcha_image = base64.b64encode(output.getvalue()).decode("ascii")
+    return jsonify(challenge_id=challenge_id, image=captcha_image, expires_in=300)
+
+
+@app.post("/api/v1/free-key")
+def claim_free_key():
+    """Reserve one unused free key after consuming a valid server CAPTCHA."""
+    data = get_payload()
+    machine_id = str(data.get("machine_id", "")).strip()
+    challenge_id = str(data.get("challenge_id", "")).strip()
+    answer = str(data.get("captcha_answer", "")).strip().upper()
+    if (not machine_id or len(machine_id) > 128 or not challenge_id
+            or len(challenge_id) > 128 or not answer or len(answer) > 8):
+        return jsonify(error="invalid_request"), 400
+    if not LICENSE_KEY_ENCRYPTION_KEY:
+        return jsonify(error="key_encryption_not_configured"), 503
+    try:
+        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii"))
+    except Exception:
+        app.logger.exception("LICENSE_KEY_ENCRYPTION_KEY is invalid")
+        return jsonify(error="key_encryption_configuration_invalid"), 503
+
+    with db() as conn:
+        challenge = conn.execute(
+            "SELECT * FROM free_key_captchas WHERE challenge_id=%s FOR UPDATE",
+            (challenge_id,),
+        ).fetchone()
+        if (not challenge or challenge["machine_id"] != machine_id
+                or challenge["used_at"] or challenge["expires_at"] <= datetime.now(timezone.utc)
+                or challenge["failed_attempts"] >= 3):
+            return jsonify(error="captcha_expired"), 400
+        expected_hash = hashlib.sha256(
+            f"{challenge_id}:{machine_id}:{answer}".encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(expected_hash, challenge["answer_hash"]):
+            conn.execute(
+                "UPDATE free_key_captchas SET failed_attempts=failed_attempts+1 WHERE challenge_id=%s",
+                (challenge_id,),
+            )
+            return jsonify(error="captcha_incorrect"), 400
+        conn.execute("UPDATE free_key_captchas SET used_at=now() WHERE challenge_id=%s", (challenge_id,))
+        # Serialize simultaneous requests from the same device so it cannot
+        # reserve multiple free keys through overlapping clicks/retries.
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (machine_id,))
+        # If the client lost the response or closed before activating, return
+        # the same reservation to that device rather than consuming another key.
+        row = conn.execute(
+            "SELECT key_hash, encrypted_key FROM licenses "
+            "WHERE is_free=TRUE AND machine_id=%s AND activated_at IS NULL AND revoked_at IS NULL "
+            "ORDER BY issued_at LIMIT 1 FOR UPDATE",
+            (machine_id,),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT key_hash, encrypted_key FROM licenses "
+                "WHERE is_free=TRUE AND machine_id IS NULL AND activated_at IS NULL AND revoked_at IS NULL "
+                "ORDER BY issued_at, key_hash LIMIT 1 FOR UPDATE SKIP LOCKED"
+            ).fetchone()
+            if row is None:
+                return jsonify(error="free_keys_unavailable"), 404
+            conn.execute(
+                "UPDATE licenses SET machine_id=%s WHERE key_hash=%s AND machine_id IS NULL",
+                (machine_id, row["key_hash"]),
+            )
+        if not row["encrypted_key"]:
+            return jsonify(error="free_key_unavailable"), 503
+        try:
+            key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError, UnicodeError):
+            return jsonify(error="free_key_unavailable"), 503
+    return jsonify(key=key, reserved=True)
 
 
 @app.get("/api/v1/admin/licenses")
