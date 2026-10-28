@@ -75,3 +75,4 @@ Sau khi `/health` hoạt động, client ở thư mục mã nguồn đã đượ
 - Các key tạo bằng `keygen_offline.py` không tự có trong database API. Muốn chuyển người dùng hiện tại, cần cấp key API mới hoặc chuẩn bị quy trình nhập/migrate key có kiểm soát.
 - Không nhúng `LICENSE_ADMIN_TOKEN` vào launcher. Chỉ đặt token trong Environment Variables của Render và PowerShell riêng trên máy quản trị.
 - Free web service có thể khởi động chậm sau idle; khi API không truy cập được, client chưa thể xác thực key.
+
