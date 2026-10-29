@@ -55,6 +55,19 @@ def init_db():
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS online_since TIMESTAMPTZ")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS offline_at TIMESTAMPTZ")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS free_license_history (
+                key_hash TEXT PRIMARY KEY,
+                key_hint TEXT NOT NULL,
+                encrypted_key TEXT,
+                duration_seconds BIGINT NOT NULL,
+                issued_at TIMESTAMPTZ NOT NULL,
+                activated_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                machine_id TEXT,
+                archived_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_free_license_expiry "
             "ON licenses(expires_at) WHERE is_free=TRUE AND expires_at IS NOT NULL"
@@ -83,7 +96,15 @@ def key_hash(key: str) -> str:
 
 
 def _cleanup_expired_free_keys(conn):
-    """Remove expired free licenses."""
+    """Archive activated expired free keys, then remove expired stock rows."""
+    conn.execute(
+        "INSERT INTO free_license_history "
+        "(key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id) "
+        "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id "
+        "FROM licenses WHERE is_free=TRUE AND activated_at IS NOT NULL "
+        "AND expires_at IS NOT NULL AND expires_at <= now() "
+        "ON CONFLICT (key_hash) DO NOTHING"
+    )
     result = conn.execute(
         "DELETE FROM licenses WHERE is_free=TRUE AND expires_at IS NOT NULL AND expires_at <= now()"
     )
@@ -443,6 +464,40 @@ def list_free_licenses():
             "status": status,
         })
     return jsonify(licenses=output, deleted_expired=True)
+
+
+@app.get("/api/v1/admin/free-key-history")
+def list_expired_free_license_history():
+    denied = require_admin()
+    if denied:
+        return denied
+    with db() as conn:
+        # Archive any newly expired rows before returning the history.
+        _cleanup_expired_free_keys(conn)
+        rows = conn.execute(
+            "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,"
+            "activated_at,expires_at,machine_id,archived_at "
+            "FROM free_license_history ORDER BY expires_at DESC"
+        ).fetchall()
+    try:
+        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
+    except Exception:
+        key_cipher = None
+    output = []
+    for row in rows:
+        key = None
+        if row["encrypted_key"] and key_cipher:
+            try:
+                key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
+            except (InvalidToken, ValueError, UnicodeError):
+                pass
+        output.append({
+            "license_id": row["key_hash"], "key": key, "key_hint": row["key_hint"],
+            "duration_seconds": row["duration_seconds"], "issued_at": row["issued_at"],
+            "activated_at": row["activated_at"], "expires_at": row["expires_at"],
+            "archived_at": row["archived_at"],
+        })
+    return jsonify(licenses=output)
 
 
 @app.post("/api/v1/admin/free-keys/delete")
