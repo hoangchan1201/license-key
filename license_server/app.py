@@ -432,7 +432,7 @@ def list_free_licenses():
         _cleanup_expired_free_keys(conn)
         rows = conn.execute(
             "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,"
-            "activated_at,expires_at,machine_id,revoked_at FROM licenses "
+            "activated_at,expires_at,machine_id,revoked_at,username FROM licenses "
             "WHERE is_free=TRUE ORDER BY issued_at DESC"
         ).fetchall()
     try:
@@ -460,6 +460,7 @@ def list_free_licenses():
             "license_id": row["key_hash"], "key": key, "key_hint": row["key_hint"],
             "duration_seconds": row["duration_seconds"], "issued_at": row["issued_at"],
             "activated_at": row["activated_at"], "expires_at": expires_at,
+            "username": row["username"],
             "seconds_left": max(0, int((expires_at - now).total_seconds())) if expires_at else None,
             "status": status,
         })
