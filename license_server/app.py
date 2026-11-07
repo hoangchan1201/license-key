@@ -65,9 +65,11 @@ def init_db():
                 activated_at TIMESTAMPTZ NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
                 machine_id TEXT,
+                username TEXT,
                 archived_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
         """)
+        conn.execute("ALTER TABLE free_license_history ADD COLUMN IF NOT EXISTS username TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_free_license_expiry "
             "ON licenses(expires_at) WHERE is_free=TRUE AND expires_at IS NOT NULL"
@@ -99,8 +101,8 @@ def _cleanup_expired_free_keys(conn):
     """Archive activated expired free keys, then remove expired stock rows."""
     conn.execute(
         "INSERT INTO free_license_history "
-        "(key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id) "
-        "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id "
+        "(key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id,username) "
+        "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id,username "
         "FROM licenses WHERE is_free=TRUE AND activated_at IS NOT NULL "
         "AND expires_at IS NOT NULL AND expires_at <= now() "
         "ON CONFLICT (key_hash) DO NOTHING"
@@ -477,7 +479,7 @@ def list_expired_free_license_history():
         _cleanup_expired_free_keys(conn)
         rows = conn.execute(
             "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,"
-            "activated_at,expires_at,machine_id,archived_at "
+            "activated_at,expires_at,machine_id,username,archived_at "
             "FROM free_license_history ORDER BY expires_at DESC"
         ).fetchall()
     try:
@@ -496,7 +498,7 @@ def list_expired_free_license_history():
             "license_id": row["key_hash"], "key": key, "key_hint": row["key_hint"],
             "duration_seconds": row["duration_seconds"], "issued_at": row["issued_at"],
             "activated_at": row["activated_at"], "expires_at": row["expires_at"],
-            "archived_at": row["archived_at"],
+            "archived_at": row["archived_at"], "username": row["username"],
         })
     return jsonify(licenses=output)
 
