@@ -18,6 +18,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_TOKEN = os.environ.get("LICENSE_ADMIN_TOKEN", "")
 LICENSE_KEY_ENCRYPTION_KEY = os.environ.get("LICENSE_KEY_ENCRYPTION_KEY", "")
 ONLINE_WINDOW_SECONDS = 100
+DEFAULT_FREE_KEY_DURATION_SECONDS = 3600
 MINIMUM_CLIENT_VERSION = os.environ.get("MINIMUM_CLIENT_VERSION", "1.0.25").strip().lstrip("vV")
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
@@ -70,6 +71,12 @@ def init_db():
             )
         """)
         conn.execute("ALTER TABLE free_license_history ADD COLUMN IF NOT EXISTS username TEXT")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS free_key_settings (
+                singleton BOOLEAN PRIMARY KEY CHECK (singleton),
+                duration_seconds BIGINT NOT NULL CHECK (duration_seconds >= 3600)
+            )
+        """)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_free_license_expiry "
             "ON licenses(expires_at) WHERE is_free=TRUE AND expires_at IS NOT NULL"
@@ -308,6 +315,31 @@ def create_licenses():
     return jsonify(created=len(generated), duration_seconds=duration_seconds, keys=generated), 201
 
 
+def _free_key_duration_seconds(conn):
+    row = conn.execute("SELECT duration_seconds FROM free_key_settings WHERE singleton=TRUE").fetchone()
+    return row["duration_seconds"] if row is not None else DEFAULT_FREE_KEY_DURATION_SECONDS
+
+
+@app.post("/api/v1/admin/free-keys/settings")
+def save_free_key_settings():
+    denied = require_admin()
+    if denied:
+        return denied
+    duration_seconds = get_payload().get("duration_seconds")
+    if type(duration_seconds) is not int or duration_seconds < 3600:
+        return jsonify(error="duration_must_be_at_least_1_hour"), 400
+    max_seconds = int((datetime.max.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds())
+    if duration_seconds > max_seconds:
+        return jsonify(error="duration_exceeds_supported_calendar_range"), 400
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO free_key_settings(singleton, duration_seconds) VALUES (TRUE,%s) "
+            "ON CONFLICT (singleton) DO UPDATE SET duration_seconds=EXCLUDED.duration_seconds",
+            (duration_seconds,),
+        )
+    return jsonify(auto_issue_duration_seconds=duration_seconds)
+
+
 @app.post("/api/v1/free-key")
 def claim_free_key():
     """Reserve and return one unused free key for this machine."""
@@ -352,16 +384,17 @@ def claim_free_key():
                 "ORDER BY issued_at, key_hash LIMIT 1 FOR UPDATE SKIP LOCKED"
             ).fetchone()
             if row is None:
-                # No prepared free keys remain: replenish on demand with one
-                # one-hour key and reserve it directly for this requester.
+                # No prepared free keys remain. Issue one at the configured
+                # duration and reserve it directly for this requester.
+                duration_seconds = _free_key_duration_seconds(conn)
                 key = "DEW-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
                 encrypted = key_cipher.encrypt(key.encode("utf-8")).decode("ascii")
                 conn.execute(
                     "INSERT INTO licenses(key_hash,key_hint,encrypted_key,duration_seconds,"
-                    "is_free,machine_id) VALUES (%s,%s,%s,3600,TRUE,%s)",
-                    (key_hash(key), key[:8] + "…" + key[-4:], encrypted, machine_id),
+                    "is_free,machine_id) VALUES (%s,%s,%s,%s,TRUE,%s)",
+                    (key_hash(key), key[:8] + "…" + key[-4:], encrypted, duration_seconds, machine_id),
                 )
-                return jsonify(key=key, reserved=True, generated=True, duration_seconds=3600)
+                return jsonify(key=key, reserved=True, generated=True, duration_seconds=duration_seconds)
             conn.execute(
                 "UPDATE licenses SET machine_id=%s WHERE key_hash=%s AND machine_id IS NULL",
                 (machine_id, row["key_hash"]),
@@ -432,6 +465,7 @@ def list_free_licenses():
     now = datetime.now(timezone.utc)
     with db() as conn:
         _cleanup_expired_free_keys(conn)
+        duration_seconds = _free_key_duration_seconds(conn)
         rows = conn.execute(
             "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,"
             "activated_at,expires_at,machine_id,revoked_at,username FROM licenses "
@@ -466,7 +500,7 @@ def list_free_licenses():
             "seconds_left": max(0, int((expires_at - now).total_seconds())) if expires_at else None,
             "status": status,
         })
-    return jsonify(licenses=output, deleted_expired=True)
+    return jsonify(licenses=output, deleted_expired=True, auto_issue_duration_seconds=duration_seconds)
 
 
 @app.get("/api/v1/admin/free-key-history")
