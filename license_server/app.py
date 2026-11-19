@@ -1,7 +1,9 @@
 """DewTool license API. Deploy as a Render web service with PostgreSQL."""
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 import secrets
 import threading
@@ -10,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from flask import Flask, jsonify, request
 from psycopg.rows import dict_row
 
@@ -17,8 +21,9 @@ app = Flask(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_TOKEN = os.environ.get("LICENSE_ADMIN_TOKEN", "")
 LICENSE_KEY_ENCRYPTION_KEY = os.environ.get("LICENSE_KEY_ENCRYPTION_KEY", "")
+OFFLINE_SIGNING_PRIVATE_KEY = os.environ.get("OFFLINE_SIGNING_PRIVATE_KEY", "")
+OFFLINE_PUBLIC_KEY_B64 = "pZGxOrhEV2ZQsADbhnKXqSrh-HEwX52FJlmNoETj17k"
 ONLINE_WINDOW_SECONDS = 100
-DEFAULT_FREE_KEY_DURATION_SECONDS = 3600
 MINIMUM_CLIENT_VERSION = os.environ.get("MINIMUM_CLIENT_VERSION", "1.0.25").strip().lstrip("vV")
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
@@ -56,34 +61,13 @@ def init_db():
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS online_since TIMESTAMPTZ")
         conn.execute("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS offline_at TIMESTAMPTZ")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS free_license_history (
-                key_hash TEXT PRIMARY KEY,
-                key_hint TEXT NOT NULL,
-                encrypted_key TEXT,
-                duration_seconds BIGINT NOT NULL,
-                issued_at TIMESTAMPTZ NOT NULL,
-                activated_at TIMESTAMPTZ NOT NULL,
-                expires_at TIMESTAMPTZ NOT NULL,
-                machine_id TEXT,
-                username TEXT,
-                archived_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        conn.execute("ALTER TABLE free_license_history ADD COLUMN IF NOT EXISTS username TEXT")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS free_key_settings (
-                singleton BOOLEAN PRIMARY KEY CHECK (singleton),
-                duration_seconds BIGINT NOT NULL CHECK (duration_seconds >= 3600)
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_free_license_expiry "
-            "ON licenses(expires_at) WHERE is_free=TRUE AND expires_at IS NOT NULL"
-        )
         conn.execute("UPDATE licenses SET online_since=last_seen WHERE online_since IS NULL AND last_seen IS NOT NULL")
 @app.before_request
 def ensure_schema():
+    # Free offline keys are signed statelessly and intentionally work even
+    # when Neon is unavailable or has reached its monthly compute quota.
+    if request.path == "/api/v1/offline-free-key":
+        return
     # Retry initialization when the free database has just resumed from idle.
     global _SCHEMA_READY
     if not _SCHEMA_READY:
@@ -96,7 +80,7 @@ def ensure_schema():
 @app.errorhandler(psycopg.errors.QueryCanceled)
 @app.errorhandler(psycopg.errors.LockNotAvailable)
 def database_request_timeout(_error):
-    app.logger.warning("Free-key request stopped by database timeout")
+    app.logger.warning("License API request stopped by database timeout")
     return jsonify(error="server_busy"), 503
 
 
@@ -104,47 +88,52 @@ def key_hash(key: str) -> str:
     return hashlib.sha256(key.strip().upper().encode("utf-8")).hexdigest()
 
 
-def _cleanup_expired_free_keys(conn):
-    """Archive activated expired free keys, then remove expired stock rows."""
-    conn.execute(
-        "INSERT INTO free_license_history "
-        "(key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id,username) "
-        "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,activated_at,expires_at,machine_id,username "
-        "FROM licenses WHERE is_free=TRUE AND activated_at IS NOT NULL "
-        "AND expires_at IS NOT NULL AND expires_at <= now() "
-        "ON CONFLICT (key_hash) DO NOTHING"
-    )
-    result = conn.execute(
-        "DELETE FROM licenses WHERE is_free=TRUE AND expires_at IS NOT NULL AND expires_at <= now()"
-    )
-    return result.rowcount
-
-
-_LAST_FREE_CLEANUP = 0.0
-_FREE_CLEANUP_LOCK = threading.Lock()
-
-
-@app.before_request
-def periodically_cleanup_expired_free_keys():
-    """Clean expired free keys at most once per minute while API is active."""
-    global _LAST_FREE_CLEANUP
-    if not _SCHEMA_READY or time.monotonic() - _LAST_FREE_CLEANUP < 60:
-        return
-    with _FREE_CLEANUP_LOCK:
-        if time.monotonic() - _LAST_FREE_CLEANUP < 60:
-            return
-        try:
-            with db() as conn:
-                conn.execute("SET LOCAL statement_timeout = '10s'")
-                _cleanup_expired_free_keys(conn)
-            _LAST_FREE_CLEANUP = time.monotonic()
-        except Exception:
-            app.logger.exception("Periodic cleanup of expired free keys failed")
-
-
 def get_payload():
     data = request.get_json(silent=True)
     return data if isinstance(data, dict) else {}
+
+
+def _urlsafe_b64(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _offline_signer() -> Ed25519PrivateKey | None:
+    """Load the owner-only signing key from Render environment variables."""
+    try:
+        encoded = str(OFFLINE_SIGNING_PRIVATE_KEY or "").strip()
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        if len(raw) != 32:
+            return None
+        signer = Ed25519PrivateKey.from_private_bytes(raw)
+        public = _urlsafe_b64(signer.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw,
+        ))
+        return signer if public == OFFLINE_PUBLIC_KEY_B64 else None
+    except Exception:
+        return None
+
+
+@app.post("/api/v1/offline-free-key")
+def issue_offline_free_key():
+    """Issue a 24-hour device-bound key without opening a database connection."""
+    machine_id = str(get_payload().get("machine_id") or "").strip()
+    if not machine_id or len(machine_id) > 128:
+        return jsonify(error="invalid_request"), 400
+    signer = _offline_signer()
+    if signer is None:
+        app.logger.error("OFFLINE_FREE_KEY_UNAVAILABLE signer is missing or mismatched")
+        return jsonify(error="offline_signer_not_configured"), 503
+    now = int(time.time())
+    expires_at = now + 86400
+    key_id = secrets.token_urlsafe(12)
+    payload = {"v": 1, "id": key_id, "exp": expires_at, "mid": machine_id, "kind": "free"}
+    encoded_payload = _urlsafe_b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    signature = _urlsafe_b64(signer.sign(encoded_payload.encode("ascii")))
+    # Render logs are the intentional temporary issuance history. Do not log
+    # the usable key itself, only its id and a non-reversible device hash.
+    device_hint = hashlib.sha256(machine_id.encode("utf-8")).hexdigest()[:12]
+    app.logger.info("OFFLINE_FREE_KEY_ISSUED id=%s device=%s expires_at=%s", key_id, device_hint, datetime.fromtimestamp(expires_at, timezone.utc).isoformat())
+    return jsonify(key=f"DEW-O1.{encoded_payload}.{signature}", expires_at=datetime.fromtimestamp(expires_at, timezone.utc).isoformat(), seconds_left=86400)
 
 
 def license_result(row, now=None):
@@ -244,6 +233,36 @@ def activate():
     return error if error else jsonify(result)
 
 
+@app.post("/api/v1/username")
+def update_client_username():
+    data = get_payload()
+    key = str(data.get("key", "")).strip().upper()
+    machine_id = str(data.get("machine_id", "")).strip()
+    username = str(data.get("username", "")).strip()
+    if not key or len(key) > 100 or not machine_id or len(machine_id) > 128:
+        return jsonify(updated=False, error="invalid_request"), 400
+    if not username or len(username) > 80:
+        return jsonify(updated=False, error="username_required_max_80_chars"), 400
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT machine_id, activated_at, expires_at, revoked_at FROM licenses WHERE key_hash=%s FOR UPDATE",
+            (key_hash(key),),
+        ).fetchone()
+        if not row:
+            return jsonify(updated=False, error="invalid_key"), 404
+        if row["revoked_at"]:
+            return jsonify(updated=False, error="revoked"), 403
+        if not row["activated_at"]:
+            return jsonify(updated=False, error="not_activated"), 409
+        if row["machine_id"] != machine_id:
+            return jsonify(updated=False, error="bound_to_another_device"), 409
+        if row["expires_at"] and row["expires_at"] <= now:
+            return jsonify(updated=False, error="expired"), 403
+        conn.execute("UPDATE licenses SET username=%s WHERE key_hash=%s", (username, key_hash(key)))
+    return jsonify(updated=True, username=username)
+
+
 @app.post("/api/v1/heartbeat")
 def heartbeat():
     result, error = verify_client_request(heartbeat=True)
@@ -309,103 +328,10 @@ def create_licenses():
             key = "DEW-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
             conn.execute(
                 "INSERT INTO licenses(key_hash,key_hint,encrypted_key,duration_seconds,is_free) VALUES (%s,%s,%s,%s,%s)",
-                (key_hash(key), key[:8] + "…" + key[-4:], key_cipher.encrypt(key.encode("utf-8")).decode("ascii"), duration_seconds, bool(data.get("free", False))),
+                (key_hash(key), key[:8] + "…" + key[-4:], key_cipher.encrypt(key.encode("utf-8")).decode("ascii"), duration_seconds, False),
             )
             generated.append(key)
     return jsonify(created=len(generated), duration_seconds=duration_seconds, keys=generated), 201
-
-
-def _free_key_duration_seconds(conn):
-    row = conn.execute("SELECT duration_seconds FROM free_key_settings WHERE singleton=TRUE").fetchone()
-    return row["duration_seconds"] if row is not None else DEFAULT_FREE_KEY_DURATION_SECONDS
-
-
-@app.post("/api/v1/admin/free-keys/settings")
-def save_free_key_settings():
-    denied = require_admin()
-    if denied:
-        return denied
-    duration_seconds = get_payload().get("duration_seconds")
-    if type(duration_seconds) is not int or duration_seconds < 3600:
-        return jsonify(error="duration_must_be_at_least_1_hour"), 400
-    max_seconds = int((datetime.max.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds())
-    if duration_seconds > max_seconds:
-        return jsonify(error="duration_exceeds_supported_calendar_range"), 400
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO free_key_settings(singleton, duration_seconds) VALUES (TRUE,%s) "
-            "ON CONFLICT (singleton) DO UPDATE SET duration_seconds=EXCLUDED.duration_seconds",
-            (duration_seconds,),
-        )
-    return jsonify(auto_issue_duration_seconds=duration_seconds)
-
-
-@app.post("/api/v1/free-key")
-def claim_free_key():
-    """Reserve and return one unused free key for this machine."""
-    data = get_payload()
-    machine_id = str(data.get("machine_id", "")).strip()
-    if not machine_id or len(machine_id) > 128:
-        return jsonify(error="invalid_request"), 400
-    if not LICENSE_KEY_ENCRYPTION_KEY:
-        return jsonify(error="key_encryption_not_configured"), 503
-    try:
-        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii"))
-    except Exception:
-        app.logger.exception("LICENSE_KEY_ENCRYPTION_KEY is invalid")
-        return jsonify(error="key_encryption_configuration_invalid"), 503
-
-    with db() as conn:
-        # Avoid leaving key reservation waiting indefinitely on a database
-        # query or row lock.
-        conn.execute("SET LOCAL lock_timeout = '8s'")
-        conn.execute("SET LOCAL statement_timeout = '15s'")
-        _cleanup_expired_free_keys(conn)
-        # Serialize simultaneous requests from the same device so it cannot
-        # reserve multiple free keys through overlapping clicks/retries.
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (machine_id,))
-        # Reuse this machine's still-valid free key. A new key becomes available
-        # after the current key expires and is removed above.
-        row = conn.execute(
-            "SELECT key_hash, encrypted_key FROM licenses "
-            "WHERE is_free=TRUE AND machine_id=%s AND revoked_at IS NULL "
-            "AND (expires_at IS NULL OR expires_at > now()) "
-            "ORDER BY issued_at DESC LIMIT 1 FOR UPDATE",
-            (machine_id,),
-        ).fetchone()
-        if row is None:
-            # Serialize pool depletion so concurrent users cannot all observe
-            # an empty stock and create unnecessary keys.
-            conn.execute("SELECT pg_advisory_xact_lock(hashtext('free-key-stock'))")
-            _cleanup_expired_free_keys(conn)
-            row = conn.execute(
-                "SELECT key_hash, encrypted_key FROM licenses "
-                "WHERE is_free=TRUE AND machine_id IS NULL AND activated_at IS NULL AND revoked_at IS NULL "
-                "ORDER BY issued_at, key_hash LIMIT 1 FOR UPDATE SKIP LOCKED"
-            ).fetchone()
-            if row is None:
-                # No prepared free keys remain. Issue one at the configured
-                # duration and reserve it directly for this requester.
-                duration_seconds = _free_key_duration_seconds(conn)
-                key = "DEW-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
-                encrypted = key_cipher.encrypt(key.encode("utf-8")).decode("ascii")
-                conn.execute(
-                    "INSERT INTO licenses(key_hash,key_hint,encrypted_key,duration_seconds,"
-                    "is_free,machine_id) VALUES (%s,%s,%s,%s,TRUE,%s)",
-                    (key_hash(key), key[:8] + "…" + key[-4:], encrypted, duration_seconds, machine_id),
-                )
-                return jsonify(key=key, reserved=True, generated=True, duration_seconds=duration_seconds)
-            conn.execute(
-                "UPDATE licenses SET machine_id=%s WHERE key_hash=%s AND machine_id IS NULL",
-                (machine_id, row["key_hash"]),
-            )
-        if not row["encrypted_key"]:
-            return jsonify(error="free_key_unavailable"), 503
-        try:
-            key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
-        except (InvalidToken, ValueError, UnicodeError):
-            return jsonify(error="free_key_unavailable"), 503
-    return jsonify(key=key, reserved=True, generated=False)
 
 
 @app.get("/api/v1/admin/licenses")
@@ -415,7 +341,6 @@ def list_licenses():
         return denied
     now = datetime.now(timezone.utc)
     with db() as conn:
-        _cleanup_expired_free_keys(conn)
         rows = conn.execute(
             "SELECT key_hash, key_hint, encrypted_key, duration_seconds, issued_at, activated_at, expires_at, last_seen, online_since, offline_at, revoked_at, username FROM licenses WHERE COALESCE(is_free,FALSE)=FALSE ORDER BY issued_at DESC"
         ).fetchall()
@@ -455,105 +380,6 @@ def list_licenses():
             "revoked": bool(row["revoked_at"]),
         })
     return jsonify(licenses=output, online_window_seconds=ONLINE_WINDOW_SECONDS)
-
-
-@app.get("/api/v1/admin/free-keys")
-def list_free_licenses():
-    denied = require_admin()
-    if denied:
-        return denied
-    now = datetime.now(timezone.utc)
-    with db() as conn:
-        _cleanup_expired_free_keys(conn)
-        duration_seconds = _free_key_duration_seconds(conn)
-        rows = conn.execute(
-            "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,"
-            "activated_at,expires_at,machine_id,revoked_at,username FROM licenses "
-            "WHERE is_free=TRUE ORDER BY issued_at DESC"
-        ).fetchall()
-    try:
-        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
-    except Exception:
-        key_cipher = None
-    output = []
-    for row in rows:
-        key = None
-        if row["encrypted_key"] and key_cipher:
-            try:
-                key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
-            except (InvalidToken, ValueError, UnicodeError):
-                pass
-        expires_at = row["expires_at"]
-        if row["revoked_at"]:
-            status = "Đã thu hồi"
-        elif row["activated_at"]:
-            status = "Đang dùng"
-        elif row["machine_id"]:
-            status = "Đã giữ — chờ kích hoạt"
-        else:
-            status = "Chưa dùng"
-        output.append({
-            "license_id": row["key_hash"], "key": key, "key_hint": row["key_hint"],
-            "duration_seconds": row["duration_seconds"], "issued_at": row["issued_at"],
-            "activated_at": row["activated_at"], "expires_at": expires_at,
-            "username": row["username"],
-            "seconds_left": max(0, int((expires_at - now).total_seconds())) if expires_at else None,
-            "status": status,
-        })
-    return jsonify(licenses=output, deleted_expired=True, auto_issue_duration_seconds=duration_seconds)
-
-
-@app.get("/api/v1/admin/free-key-history")
-def list_expired_free_license_history():
-    denied = require_admin()
-    if denied:
-        return denied
-    with db() as conn:
-        # Archive any newly expired rows before returning the history.
-        _cleanup_expired_free_keys(conn)
-        rows = conn.execute(
-            "SELECT key_hash,key_hint,encrypted_key,duration_seconds,issued_at,"
-            "activated_at,expires_at,machine_id,username,archived_at "
-            "FROM free_license_history ORDER BY expires_at DESC"
-        ).fetchall()
-    try:
-        key_cipher = Fernet(LICENSE_KEY_ENCRYPTION_KEY.encode("ascii")) if LICENSE_KEY_ENCRYPTION_KEY else None
-    except Exception:
-        key_cipher = None
-    output = []
-    for row in rows:
-        key = None
-        if row["encrypted_key"] and key_cipher:
-            try:
-                key = key_cipher.decrypt(row["encrypted_key"].encode("ascii")).decode("utf-8")
-            except (InvalidToken, ValueError, UnicodeError):
-                pass
-        output.append({
-            "license_id": row["key_hash"], "key": key, "key_hint": row["key_hint"],
-            "duration_seconds": row["duration_seconds"], "issued_at": row["issued_at"],
-            "activated_at": row["activated_at"], "expires_at": row["expires_at"],
-            "archived_at": row["archived_at"], "username": row["username"],
-        })
-    return jsonify(licenses=output)
-
-
-@app.post("/api/v1/admin/free-keys/delete")
-def delete_free_license():
-    denied = require_admin()
-    if denied:
-        return denied
-    data = get_payload()
-    license_id = str(data.get("license_id", "")).strip().lower()
-    if len(license_id) != 64 or any(char not in "0123456789abcdef" for char in license_id):
-        return jsonify(error="license_id_required"), 400
-    with db() as conn:
-        result = conn.execute(
-            "DELETE FROM licenses WHERE key_hash=%s AND is_free=TRUE",
-            (license_id,),
-        )
-        if result.rowcount == 0:
-            return jsonify(error="free_key_not_found"), 404
-    return jsonify(deleted=True)
 
 
 def _admin_license_id():
