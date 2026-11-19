@@ -152,16 +152,11 @@ def license_result(row, now=None):
 
 @app.get("/health")
 def health():
-    try:
-        with db() as conn:
-            conn.execute("SELECT 1")
-        return jsonify(ok=True, service="DewTool License API")
-    except Exception:
-        app.logger.exception("health check failed")
-        return jsonify(ok=False), 503
+    # A health check must not wake or consume the serverless database.
+    return jsonify(ok=True, service="DewTool License API")
 
 
-def verify_client_request(heartbeat=False):
+def verify_client_request():
     client_version = str(request.headers.get("X-Client-Version", "")).strip().lstrip("vV")
     if not _client_version_is_supported(client_version):
         return None, (jsonify(
@@ -189,7 +184,6 @@ def verify_client_request(heartbeat=False):
             return None, (jsonify(valid=False, error="revoked"), 403)
         if row["machine_id"] and row["machine_id"] != machine_id:
             return None, (jsonify(valid=False, error="bound_to_another_device"), 409)
-        new_online_session = not row["last_seen"] or (now - row["last_seen"]).total_seconds() > ONLINE_WINDOW_SECONDS
         if not row["activated_at"]:
             if not username:
                 return None, (jsonify(valid=False, error="username_required"), 400)
@@ -203,10 +197,11 @@ def verify_client_request(heartbeat=False):
             row["username"] = username
         elif row["expires_at"] <= now:
             return None, (jsonify(valid=False, error="expired", expires_at=row["expires_at"].isoformat()), 403)
-        conn.execute("UPDATE licenses SET last_seen=%s, online_since=CASE WHEN %s THEN %s ELSE online_since END, offline_at=CASE WHEN %s THEN NULL ELSE offline_at END WHERE key_hash=%s",
-                     (now, new_online_session, now, new_online_session, row["key_hash"]))
-        if new_online_session:
-            row["online_since"] = now
+        # Only record a single ON marker when the tool explicitly verifies
+        # its key. Periodic heartbeats are intentionally not used.
+        conn.execute("UPDATE licenses SET last_seen=%s, online_since=%s, offline_at=NULL WHERE key_hash=%s",
+                     (now, now, row["key_hash"]))
+        row["online_since"] = now
         row["last_seen"] = now
         return license_result(row, now), None
 
@@ -263,12 +258,6 @@ def update_client_username():
     return jsonify(updated=True, username=username)
 
 
-@app.post("/api/v1/heartbeat")
-def heartbeat():
-    result, error = verify_client_request(heartbeat=True)
-    return error if error else jsonify(result)
-
-
 @app.post("/api/v1/offline")
 def client_offline():
     data = get_payload()
@@ -278,8 +267,8 @@ def client_offline():
         return jsonify(error="invalid_request"), 400
     with db() as conn:
         result = conn.execute(
-            "UPDATE licenses SET offline_at=CASE WHEN last_seen IS NOT NULL THEN LEAST(%s, last_seen + (%s * INTERVAL '1 second')) ELSE offline_at END, last_seen=NULL, online_since=NULL WHERE key_hash=%s AND machine_id=%s",
-            (datetime.now(timezone.utc), ONLINE_WINDOW_SECONDS, key_hash(key), machine_id),
+            "UPDATE licenses SET offline_at=%s, last_seen=NULL, online_since=NULL WHERE key_hash=%s AND machine_id=%s",
+            (datetime.now(timezone.utc), key_hash(key), machine_id),
         )
         if result.rowcount == 0:
             return jsonify(error="license_or_machine_not_found"), 404
@@ -350,20 +339,11 @@ def list_licenses():
         key_cipher = None
     output = []
     for row in rows:
-        online = bool(row["last_seen"] and (now - row["last_seen"]).total_seconds() <= ONLINE_WINDOW_SECONDS and not row["revoked_at"] and (not row["expires_at"] or row["expires_at"] > now))
-        online_seconds = max(0, int((now - row["online_since"]).total_seconds())) if online and row["online_since"] else 0
+        # ON stays visible from the explicit verification until a normal tool
+        # close writes OFF. A forced close cannot be detected without a
+        # recurring heartbeat, by design.
+        online = bool(row["online_since"] and not row["offline_at"] and not row["revoked_at"] and (not row["expires_at"] or row["expires_at"] > now))
         offline_at = row["offline_at"]
-        if not online and offline_at is None:
-            # Nếu heartbeat mất đột ngột, ước tính OFF sau khi hết cửa sổ
-            # heartbeat 100 giây tính từ lần cuối server nhận được.
-            candidates = []
-            if row["last_seen"]:
-                candidates.append(row["last_seen"] + timedelta(seconds=ONLINE_WINDOW_SECONDS))
-            if row["revoked_at"]:
-                candidates.append(row["revoked_at"])
-            if row["expires_at"] and row["expires_at"] <= now:
-                candidates.append(row["expires_at"])
-            offline_at = min(candidates) if candidates else None
         full_key = None
         if row["encrypted_key"] and key_cipher:
             try:
@@ -373,13 +353,13 @@ def list_licenses():
         output.append({
             "license_id": row["key_hash"], "key_hint": row["key_hint"], "key": full_key,
             "username": row["username"],
-            "online_seconds": online_seconds,
+            "online_since": row["online_since"],
             "offline_at": offline_at,
             "duration_seconds": row["duration_seconds"], "activated_at": row["activated_at"],
             "expires_at": row["expires_at"], "online": online,
             "revoked": bool(row["revoked_at"]),
         })
-    return jsonify(licenses=output, online_window_seconds=ONLINE_WINDOW_SECONDS)
+    return jsonify(licenses=output)
 
 
 def _admin_license_id():
@@ -407,7 +387,7 @@ def revoke_license():
     if not license_id:
         return jsonify(error="key_required"), 400
     with db() as conn:
-        result = conn.execute("UPDATE licenses SET revoked_at=now(), offline_at=CASE WHEN last_seen IS NOT NULL THEN LEAST(now(), last_seen + (%s * INTERVAL '1 second')) ELSE offline_at END, last_seen=NULL, online_since=NULL WHERE key_hash=%s", (ONLINE_WINDOW_SECONDS, license_id))
+        result = conn.execute("UPDATE licenses SET revoked_at=now(), offline_at=now(), last_seen=NULL, online_since=NULL WHERE key_hash=%s", (license_id,))
         if result.rowcount == 0:
             return jsonify(error="not_found"), 404
     return jsonify(revoked=True)
