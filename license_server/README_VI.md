@@ -1,6 +1,6 @@
 # DewTool License API — hướng dẫn triển khai
 
-API này thay cho bước xác thực license offline sau khi đã deploy và cấu hình URL ở client. Key chỉ bắt đầu tính hạn ở lần kích hoạt đầu tiên, bị khóa với một `machine_id`, gửi heartbeat mỗi 30 giây và hiện online nếu heartbeat trong 100 giây gần nhất.
+API này thay cho bước xác thực license offline sau khi đã deploy và cấu hình URL ở client. Key chỉ bắt đầu tính hạn ở lần kích hoạt đầu tiên và bị khóa với một `machine_id`. Tool chỉ ghi mốc ON khi mở/xác thực và mốc OFF khi thoát bình thường; không gửi heartbeat định kỳ tới database.
 
 ## 1. Tạo database Neon
 
@@ -24,8 +24,8 @@ API này thay cho bước xác thực license offline sau khi đã deploy và c�
    - `DATABASE_URL`: connection string lấy từ Neon.
    - `LICENSE_ADMIN_TOKEN`: tạo chuỗi bí mật dài, ngẫu nhiên và giữ riêng.
    - `LICENSE_KEY_ENCRYPTION_KEY`: sau khi cập nhật server, tạo key Fernet bằng `py -m pip install cryptography` rồi chạy `py -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`; lưu kết quả vào biến này trên Render. Giữ bí mật và sao lưu an toàn; không đổi/mất key này nếu muốn xem lại license key đầy đủ.
-   - `MINIMUM_CLIENT_VERSION`: phiên bản tối thiểu được phép dùng, hiện đặt `1.0.25`. Client không gửi phiên bản hoặc gửi phiên bản thấp hơn sẽ bị từ chối ở kích hoạt và heartbeat (HTTP 426).
-5. Trước khi đặt ngưỡng bắt buộc, hãy build DewTool `1.0.25`, tải ZIP lên release `DewTool-Updates` (asset cập nhật cần đúng quy ước tên trong launcher), rồi kiểm tra bản mới chạy được. Sau đó đặt `MINIMUM_CLIENT_VERSION=1.0.25` trong Render và deploy server. Mở URL service kèm `/health`; phải thấy `{"ok":true,...}`. Bản cũ không gửi header phiên bản sẽ bị chặn ngay ở lần kích hoạt/heartbeat kế tiếp.
+   - `MINIMUM_CLIENT_VERSION`: phiên bản tối thiểu được phép dùng, hiện đặt `1.0.25`. Client không gửi phiên bản hoặc gửi phiên bản thấp hơn sẽ bị từ chối khi kích hoạt (HTTP 426).
+5. Trước khi đặt ngưỡng bắt buộc, hãy build DewTool `1.0.25`, tải ZIP lên release `DewTool-Updates` (asset cập nhật cần đúng quy ước tên trong launcher), rồi kiểm tra bản mới chạy được. Sau đó đặt `MINIMUM_CLIENT_VERSION=1.0.25` trong Render và deploy server. Mở URL service kèm `/health`; phải thấy `{"ok":true,...}`. Bản cũ không gửi header phiên bản sẽ bị chặn khi kích hoạt.
 
 > Render Free có thể sleep sau 15 phút không có request; lần gọi đầu sau sleep sẽ khởi động lại. Không dùng Render Free PostgreSQL cho license lâu dài vì database miễn phí hết hạn sau 30 ngày. API service chỉ lưu dữ liệu trong Neon.
 
@@ -61,11 +61,17 @@ py admin_cli.py revoke --key "DEW-..."
 py admin_cli.py reset --key "DEW-..."
 ```
 
-`list` hiển thị key đã che một phần, hạn và online/offline. Online nghĩa là server nhận heartbeat trong vòng 100 giây. Bản server mới mã hóa key để admin có thể xem/copy lại. Các key cũ chỉ lưu hash nên không thể khôi phục nội dung đầy đủ. `reset` xóa liên kết máy và ngày kích hoạt; lần dùng tiếp theo bắt đầu lại thời hạn, nên chỉ dùng khi cần hỗ trợ đổi máy.
+`list` hiển thị key đã che một phần, hạn và online/offline. Online nghĩa là tool đã ghi mốc ON và chưa ghi mốc OFF khi thoát bình thường. Bản server mới mã hóa key để admin có thể xem/copy lại. Các key cũ chỉ lưu hash nên không thể khôi phục nội dung đầy đủ. `reset` xóa liên kết máy và ngày kích hoạt; lần dùng tiếp theo bắt đầu lại thời hạn, nên chỉ dùng khi cần hỗ trợ đổi máy.
 
 Dialog **Quản lý License — Admin** cũng hỗ trợ giảm cùng một khoảng thời hạn cho một hoặc nhiều key đã chọn. Mỗi key phải còn ít nhất 1 giờ sau khi trừ; nếu bất kỳ key nào không hợp lệ hoặc không đủ thời hạn, cả lô sẽ bị từ chối. Tính năng này cần deploy phiên bản server có endpoint `/api/v1/admin/reduce` trước khi dùng.
 
-Nút **Key miễn phí** trong License Admin tạo và quản lý kho key miễn phí; key miễn phí chỉ hiển thị trong dialog này, không xuất hiện trong bảng license thường. Dialog cho phép chọn và xóa vĩnh viễn một hoặc nhiều key miễn phí. Người dùng bấm **Get key free** để nhận key; server chỉ cho mỗi machine ID giữ một key miễn phí còn hạn và trả lại đúng key đó nếu yêu cầu lại. Key free đã kích hoạt sẽ bị xóa khi hết hạn (dọn tối đa mỗi phút khi API đang hoạt động, đồng thời dọn lúc xem kho hoặc yêu cầu key). Khi kho chưa kích hoạt đã hết, endpoint tự tạo và cấp ngay một key miễn phí thời hạn 1 giờ. API này không dùng CAPTCHA. Tính năng cần cột `is_free` và các endpoint quản lý trong `/api/v1/admin/free-keys` cùng `/api/v1/free-key`; schema tự bổ sung khi server khởi động.
+Tính năng key miễn phí đã được loại bỏ. License được cấp và quản lý trực tiếp trong tab **License** của Quản trị License; ứng dụng không còn lấy key từ endpoint cấp key miễn phí.
+
+## Key offline miễn phí 1 ngày
+
+Endpoint `POST /api/v1/offline-free-key` ký một key offline, gắn với mã máy và có hạn 24 giờ. Endpoint này không kết nối Neon/Postgres và chỉ ghi lịch sử tạm thời (mã key, mã băm ngắn của máy, hạn dùng) vào log Render.
+
+Trên Render, thêm biến môi trường bí mật `OFFLINE_SIGNING_PRIVATE_KEY`: nội dung chính xác của file `%APPDATA%\DewToolLicense\offline_fallback_ed25519.key` trên máy Admin. Không đưa giá trị này vào GitHub, file build, hoặc gửi cho người dùng. Khóa phải khớp với public key đã có trong `license_offline_fallback.py`; nếu không server từ chối cấp key.
 
 ## 6. Kết nối launcher
 
