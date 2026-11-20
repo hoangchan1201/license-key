@@ -27,6 +27,10 @@ ONLINE_WINDOW_SECONDS = 100
 MINIMUM_CLIENT_VERSION = os.environ.get("MINIMUM_CLIENT_VERSION", "1.0.25").strip().lstrip("vV")
 _SCHEMA_READY = False
 _SCHEMA_LOCK = threading.Lock()
+# Short-lived commands for clients already running. This lives only in Render
+# RAM and is intentionally independent from Neon/Postgres.
+_RUNTIME_COMMANDS: dict[str, dict] = {}
+_RUNTIME_COMMANDS_LOCK = threading.Lock()
 
 
 def db():
@@ -66,7 +70,7 @@ def init_db():
 def ensure_schema():
     # Free offline keys are signed statelessly and intentionally work even
     # when Neon is unavailable or has reached its monthly compute quota.
-    if request.path == "/api/v1/offline-free-key":
+    if request.path in {"/api/v1/offline-free-key", "/api/v1/runtime-check"}:
         return
     # Retry initialization when the free database has just resumed from idle.
     global _SCHEMA_READY
@@ -86,6 +90,22 @@ def database_request_timeout(_error):
 
 def key_hash(key: str) -> str:
     return hashlib.sha256(key.strip().upper().encode("utf-8")).hexdigest()
+
+
+def _set_runtime_command(license_id: str, action: str, expires_at=None) -> None:
+    """Queue an in-memory admin update without polling the database."""
+    if not license_id:
+        return
+    command = {"action": action, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if expires_at is not None:
+        command["expires_at"] = expires_at.isoformat()
+    with _RUNTIME_COMMANDS_LOCK:
+        _RUNTIME_COMMANDS[license_id] = command
+
+
+def _clear_runtime_command(license_id: str) -> None:
+    with _RUNTIME_COMMANDS_LOCK:
+        _RUNTIME_COMMANDS.pop(license_id, None)
 
 
 def get_payload():
@@ -201,6 +221,7 @@ def verify_client_request():
         # its key. Periodic heartbeats are intentionally not used.
         conn.execute("UPDATE licenses SET last_seen=%s, online_since=%s, offline_at=NULL WHERE key_hash=%s",
                      (now, now, row["key_hash"]))
+        _clear_runtime_command(row["key_hash"])
         row["online_since"] = now
         row["last_seen"] = now
         return license_result(row, now), None
@@ -226,6 +247,23 @@ def _client_version_is_supported(version):
 def activate():
     result, error = verify_client_request()
     return error if error else jsonify(result)
+
+
+@app.post("/api/v1/runtime-check")
+def runtime_check():
+    """Read pending admin commands from RAM without opening Neon/Postgres."""
+    key = str(get_payload().get("key", "")).strip().upper()
+    if not key or len(key) > 100:
+        return jsonify(error="invalid_request"), 400
+    with _RUNTIME_COMMANDS_LOCK:
+        command = dict(_RUNTIME_COMMANDS.get(key_hash(key), {"action": "none"}))
+    if command.get("action") == "expiry_changed" and command.get("expires_at"):
+        try:
+            expires_at = datetime.fromisoformat(str(command["expires_at"]).replace("Z", "+00:00"))
+            command["seconds_left"] = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+        except (TypeError, ValueError):
+            command = {"action": "none"}
+    return jsonify(command)
 
 
 @app.post("/api/v1/username")
@@ -390,6 +428,7 @@ def revoke_license():
         result = conn.execute("UPDATE licenses SET revoked_at=now(), offline_at=now(), last_seen=NULL, online_since=NULL WHERE key_hash=%s", (license_id,))
         if result.rowcount == 0:
             return jsonify(error="not_found"), 404
+    _set_runtime_command(license_id, "revoked")
     return jsonify(revoked=True)
 
 
@@ -408,6 +447,7 @@ def reset_license():
         )
         if result.rowcount == 0:
             return jsonify(error="not_found"), 404
+    _set_runtime_command(license_id, "reset")
     return jsonify(reset=True)
 
 
@@ -423,6 +463,7 @@ def delete_license():
         result = conn.execute("DELETE FROM licenses WHERE key_hash=%s", (license_id,))
         if result.rowcount == 0:
             return jsonify(error="not_found"), 404
+    _set_runtime_command(license_id, "deleted")
     return jsonify(deleted=True)
 
 
@@ -488,6 +529,8 @@ def extend_license():
                 "UPDATE licenses SET duration_seconds=%s, activated_at=%s, expires_at=%s WHERE key_hash=%s",
                 (total_seconds, activated_at, expires_at, license_id),
             )
+    if expires_at is not None:
+        _set_runtime_command(license_id, "expiry_changed", expires_at)
     return jsonify(extended=True, added_seconds=added_seconds, duration_seconds=total_seconds,
                    expires_at=expires_at.isoformat() if expires_at else None)
 
@@ -564,6 +607,8 @@ def reduce_licenses():
                 "duration_seconds": new_duration,
                 "expires_at": expires_at.isoformat() if expires_at else None,
             })
+            if expires_at is not None:
+                _set_runtime_command(license_id, "expiry_changed", expires_at)
     return jsonify(reduced=len(results), reduced_seconds=reduce_seconds, licenses=results)
 
 
